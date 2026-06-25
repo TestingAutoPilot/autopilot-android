@@ -92,7 +92,7 @@ The same JSON plan format runs across platforms:
 
 | Platform | Repo | Result |
 |---|---|---|
-| macOS | [`autopilot-macos`](https://github.com/jschwefel-CBB/autopilot-macos) | Full support |
+| macOS | [`autopilot-macos`](https://github.com/jschwefel-CBB/autopilot-macos) | 78 PASS (supports the 3 visual steps) |
 | iOS | [`autopilot-ios`](https://github.com/jschwefel-CBB/autopilot-ios) | 75 PASS + 3 SKIP |
 | Android | this repo | 75 PASS + 3 SKIP |
 
