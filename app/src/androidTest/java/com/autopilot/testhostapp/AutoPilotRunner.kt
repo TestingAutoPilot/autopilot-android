@@ -149,11 +149,17 @@ class AutoPilotRunner(
     private fun findElement(sel: SelectorJson): UiObject {
         var obj = resolveElement(sel)
         if (obj.exists()) return obj
-        // (DOPE-70/71/72/73) Target not visible. Two causes, handled in order:
-        //  3a) the soft keyboard is covering it (typed into a prior field) — dismiss
-        //      the IME, which re-reveals the lower fields of a form/dialog;
-        //  3b) dynamic content (a growing list) pushed it below the fold — scroll
-        //      its scrollable ancestor to bring it back.
+        // Brief settle + retry first — a just-raised IME can momentarily disrupt
+        // the query for a field that is actually on-screen (Round-4 evidence:
+        // nameField was visible yet first resolve missed it). Cheapest recovery.
+        Thread.sleep(200)
+        obj = resolveElement(sel)
+        if (obj.exists()) return obj
+        // (DOPE-70/71/72/73, DOPE-76) Still not found. Two causes, handled in order:
+        //  3a) the soft keyboard is covering it — dismiss the IME NON-DESTRUCTIVELY
+        //      (never pressBack: it would close a modal dialog);
+        //  3b) dynamic content (a growing list / Compose scroll) pushed it below
+        //      the fold — scroll it back (handle-based, else bounds-based swipes).
         forceDismissIme()
         obj = resolveElement(sel)
         if (obj.exists()) return obj
@@ -165,32 +171,57 @@ class AutoPilotRunner(
         return resolveElement(sel)
     }
 
-    // Generic, Compose-friendly scroll-into-view via UiObject2: find a scrollable
-    // container and scroll toward the target by its content-description. Tries
-    // forward (down) then backward (up). Works for LazyColumn / scrollable dialogs
-    // where the legacy UiScrollable(ScrollView) path does not apply.
+    // (DOPE-76) Compose-friendly scroll-into-view. Compose scroll containers
+    // (Modifier.verticalScroll / LazyColumn) do NOT expose scrollable="true" on a
+    // recognizable android.widget.ScrollView, so By.scrollable(true) often finds
+    // nothing and the legacy UiScrollable path has no handle. So:
+    //  1. If a real scrollable node exists, drive it (LazyColumn sometimes does).
+    //  2. Otherwise fall back to BOUNDS-BASED swipes on the content area —
+    //     swipe up to reveal content below, then down, re-checking for the target
+    //     by content-desc between swipes. This needs no scrollable handle.
     private fun scrollIntoViewCompose(sel: SelectorJson) {
         val id = sel.identifier ?: sel.within?.identifier ?: return
         try {
-            val scrollables = device.findObjects(By.scrollable(true))
-            if (scrollables.isEmpty()) return
-            // Prefer the largest scrollable (the content area) over a small nested one.
-            val container = scrollables.maxByOrNull {
-                it.visibleBounds.width() * it.visibleBounds.height()
-            } ?: return
-            container.setGestureMargin(container.visibleBounds.height() / 8)
-            // Scroll down looking for the target, then up if not found.
-            repeat(8) {
+            val container = device.findObjects(By.scrollable(true))
+                .maxByOrNull { it.visibleBounds.width() * it.visibleBounds.height() }
+            if (container != null) {
+                container.setGestureMargin(container.visibleBounds.height() / 8)
+                repeat(8) {
+                    if (device.hasObject(By.desc(id))) return
+                    container.scroll(Direction.DOWN, 0.6f); Thread.sleep(120)
+                }
+                repeat(8) {
+                    if (device.hasObject(By.desc(id))) return
+                    container.scroll(Direction.UP, 0.6f); Thread.sleep(120)
+                }
                 if (device.hasObject(By.desc(id))) return
-                container.scroll(Direction.DOWN, 0.6f)
-                Thread.sleep(120)
             }
-            repeat(8) {
-                if (device.hasObject(By.desc(id))) return
-                container.scroll(Direction.UP, 0.6f)
-                Thread.sleep(120)
-            }
+            // Bounds-based fallback (Compose scroll with no scrollable handle).
+            swipeScanForDesc(id)
         } catch (_: Exception) {}
+    }
+
+    // Reveal an off-screen content-desc target by swiping the content area itself
+    // (no scrollable handle needed). Swipes within the middle band of the screen
+    // — above any keyboard, below the toolbar — re-checking after each. Up-swipes
+    // (reveal-below) first since growing lists push the add-row downward, then
+    // down-swipes. Returns as soon as the target appears.
+    private fun swipeScanForDesc(id: String) {
+        val w = device.displayWidth
+        val h = device.displayHeight
+        val x = w / 2
+        val top = (h * 0.30).toInt()      // below the app bar
+        val bottom = (h * 0.62).toInt()   // above where the IME would sit
+        repeat(8) {
+            if (device.hasObject(By.desc(id))) return
+            device.swipe(x, bottom, x, top, 24)   // content moves up → reveal below
+            Thread.sleep(150)
+        }
+        repeat(8) {
+            if (device.hasObject(By.desc(id))) return
+            device.swipe(x, top, x, bottom, 24)   // content moves down → reveal above
+            Thread.sleep(150)
+        }
     }
 
     private fun resolveElement(sel: SelectorJson): UiObject {
@@ -604,15 +635,33 @@ class AutoPilotRunner(
     // (never a stray Back that pops a dialog/screen). (DOPE-70/71/72/73) Only
     // called when an element wasn't found, NOT after every type — so the heavier
     // dumpsys check here is not on the hot path.
+    // (DOPE-70/71/72/73) NON-DESTRUCTIVE IME dismissal for the not-found recovery
+    // path. MUST NOT use pressBack: a Back press inside a modal (e.g. the ammo
+    // Add-Custom-Ammo AlertDialog) closes the WHOLE DIALOG, not the keyboard —
+    // that was the Round-3 regression. Try ESCAPE, then ask the InputMethodManager
+    // to hide the IME (no key/back event). If the keyboard still won't hide, just
+    // proceed: an un-occluded field is still queryable; only a genuinely
+    // keyboard-covered control needs more, and Back is never an acceptable cost.
     private fun forceDismissIme() {
         try {
             if (!isImeShown()) return
-            device.executeShellCommand("input keyevent 111")  // ESCAPE
-            Thread.sleep(200)
-            if (isImeShown()) {
-                device.pressBack()
-                Thread.sleep(250)
+            device.executeShellCommand("input keyevent 111")  // ESCAPE — no back nav
+            Thread.sleep(150)
+            if (!isImeShown()) return
+            // InputMethodManager.hideSoftInputFromWindow on the focused view's
+            // window token — hides the IME without any back event.
+            instrumentation.runOnMainSync {
+                try {
+                    val imm = instrumentation.targetContext
+                        .getSystemService(android.content.Context.INPUT_METHOD_SERVICE)
+                        as? android.view.inputmethod.InputMethodManager
+                    val token = instrumentation.targetContext
+                        .let { (it as? android.app.Activity)?.currentFocus?.windowToken }
+                    if (token != null) imm?.hideSoftInputFromWindow(token, 0)
+                } catch (_: Exception) {}
             }
+            Thread.sleep(150)
+            // Whatever the IME state now, do NOT pressBack. Proceed.
         } catch (_: Exception) {}
     }
 
