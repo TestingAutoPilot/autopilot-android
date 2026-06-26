@@ -147,11 +147,50 @@ class AutoPilotRunner(
     // ── Element finding ─────────────────────────────────────────────────────
 
     private fun findElement(sel: SelectorJson): UiObject {
-        val obj = resolveElement(sel)
-        if (!obj.exists()) {
-            scrollIntoView(sel)
-        }
+        var obj = resolveElement(sel)
+        if (obj.exists()) return obj
+        // (DOPE-70/71/72/73) Target not visible. Two causes, handled in order:
+        //  3a) the soft keyboard is covering it (typed into a prior field) — dismiss
+        //      the IME, which re-reveals the lower fields of a form/dialog;
+        //  3b) dynamic content (a growing list) pushed it below the fold — scroll
+        //      its scrollable ancestor to bring it back.
+        forceDismissIme()
+        obj = resolveElement(sel)
+        if (obj.exists()) return obj
+        scrollIntoViewCompose(sel)
+        obj = resolveElement(sel)
+        if (obj.exists()) return obj
+        // Legacy fixture-oriented fallback (TestHostApp ScrollView paths).
+        scrollIntoView(sel)
         return resolveElement(sel)
+    }
+
+    // Generic, Compose-friendly scroll-into-view via UiObject2: find a scrollable
+    // container and scroll toward the target by its content-description. Tries
+    // forward (down) then backward (up). Works for LazyColumn / scrollable dialogs
+    // where the legacy UiScrollable(ScrollView) path does not apply.
+    private fun scrollIntoViewCompose(sel: SelectorJson) {
+        val id = sel.identifier ?: sel.within?.identifier ?: return
+        try {
+            val scrollables = device.findObjects(By.scrollable(true))
+            if (scrollables.isEmpty()) return
+            // Prefer the largest scrollable (the content area) over a small nested one.
+            val container = scrollables.maxByOrNull {
+                it.visibleBounds.width() * it.visibleBounds.height()
+            } ?: return
+            container.setGestureMargin(container.visibleBounds.height() / 8)
+            // Scroll down looking for the target, then up if not found.
+            repeat(8) {
+                if (device.hasObject(By.desc(id))) return
+                container.scroll(Direction.DOWN, 0.6f)
+                Thread.sleep(120)
+            }
+            repeat(8) {
+                if (device.hasObject(By.desc(id))) return
+                container.scroll(Direction.UP, 0.6f)
+                Thread.sleep(120)
+            }
+        } catch (_: Exception) {}
     }
 
     private fun resolveElement(sel: SelectorJson): UiObject {
@@ -548,13 +587,43 @@ class AutoPilotRunner(
         } catch (_: Exception) { null }
     }
 
-    // Close the soft keyboard. KEYCODE_ESCAPE (111) dismisses the IME without
-    // triggering back navigation or editor actions on API 30+.
+    // Close the soft keyboard. KEYCODE_ESCAPE dismisses the IME without
+    // back-navigation on most apps. Cheap (no service dump) — runs after every
+    // type, so it must stay light. The stronger guarded-Back dismissal lives in
+    // forceDismissIme(), invoked only on the rare not-found recovery path.
     private fun closeIme() {
         try {
-            device.executeShellCommand("input keyevent 111")
+            device.executeShellCommand("input keyevent 111")  // ESCAPE
             Thread.sleep(200)
         } catch (_: Exception) {}
+    }
+
+    // Stronger IME dismissal for the not-found recovery path (a covered field):
+    // if the keyboard is still shown after ESCAPE, a GUARDED Back press hides it —
+    // guarded by isImeShown() so Back consumes the keyboard rather than navigating
+    // (never a stray Back that pops a dialog/screen). (DOPE-70/71/72/73) Only
+    // called when an element wasn't found, NOT after every type — so the heavier
+    // dumpsys check here is not on the hot path.
+    private fun forceDismissIme() {
+        try {
+            if (!isImeShown()) return
+            device.executeShellCommand("input keyevent 111")  // ESCAPE
+            Thread.sleep(200)
+            if (isImeShown()) {
+                device.pressBack()
+                Thread.sleep(250)
+            }
+        } catch (_: Exception) {}
+    }
+
+    // True when the soft keyboard is currently shown. Reads the input-method
+    // service's window-visibility flag. Heavier (a service dump) — call only off
+    // the hot path (the not-found recovery in findElement), never per-type.
+    private fun isImeShown(): Boolean {
+        return try {
+            val out = device.executeShellCommand("dumpsys input_method")
+            out.contains("mInputShown=true")
+        } catch (_: Exception) { false }
     }
 
     // ── scroll ───────────────────────────────────────────────────────────────
