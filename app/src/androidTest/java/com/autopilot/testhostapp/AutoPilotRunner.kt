@@ -206,10 +206,24 @@ class AutoPilotRunner(
                 }
                 else -> {
                     val t = element.text
-                    if (!t.isNullOrEmpty()) t else ""
+                    if (!t.isNullOrEmpty()) t else composeFieldValue(element)
                 }
             }
         } catch (e: Exception) { "" }
+    }
+
+    // Jetpack Compose splits a TextField across two UiAutomator nodes: the
+    // contentDescription lands on a (usually empty) wrapper View, while the
+    // editable text lives on a descendant EditText that carries NO desc. When a
+    // desc-matched node has no text of its own, descend to that inner EditText
+    // and read its value. Returns "" when there is no such descendant (i.e. the
+    // node genuinely has no value) so classic-View behavior is unchanged.
+    private fun composeFieldValue(element: UiObject): String {
+        return try {
+            val inner = element.getChild(UiSelector().className("android.widget.EditText"))
+            val t = if (inner.exists()) inner.text else null
+            if (!t.isNullOrEmpty()) t else ""
+        } catch (_: Exception) { "" }
     }
 
     // ── Step dispatch ────────────────────────────────────────────────────────
@@ -412,7 +426,9 @@ class AutoPilotRunner(
         val sel = step.target ?: return StepResult(id, passed = false, skipped = false, message = "no target")
         val text = step.args?.text ?: return StepResult(id, passed = false, skipped = false, message = "no text arg")
         val clear = step.args.clear ?: false
-        val element = findElement(sel)
+        // Compose: the desc-matched node may be a wrapper; the editable EditText is
+        // a descendant. setText/focus must target the editable node, not the wrapper.
+        val element = editableNode(findElement(sel))
         if (clear) {
             element.setText("")  // accessibility ACTION_SET_TEXT — clears regardless of focus
             Thread.sleep(50)
@@ -431,7 +447,7 @@ class AutoPilotRunner(
         val id = step.id ?: "?"
         val sel = step.target ?: return StepResult(id, passed = false, skipped = false, message = "no target")
         val text = step.args?.text ?: return StepResult(id, passed = false, skipped = false, message = "no text arg")
-        val element = findElement(sel)
+        val element = editableNode(findElement(sel))
         element.setText("")
         Thread.sleep(50)
         focusElement(element)
@@ -439,6 +455,18 @@ class AutoPilotRunner(
         Thread.sleep(400)
         closeIme()
         return StepResult(id, passed = true, skipped = false)
+    }
+
+    // Resolve the node that actually accepts text. A classic-View EditText carries
+    // both its contentDescription and its editable text, so it IS the editable
+    // node. A Compose TextField exposes the desc on a wrapper View whose editable
+    // text lives on a descendant EditText — in that case return the descendant.
+    private fun editableNode(matched: UiObject): UiObject {
+        return try {
+            if (matched.className == "android.widget.EditText") return matched
+            val inner = matched.getChild(UiSelector().className("android.widget.EditText"))
+            if (inner.exists()) inner else matched
+        } catch (_: Exception) { matched }
     }
 
     // Focus an EditText for keyboard input. Uses the Activity's requestFocusOnField
