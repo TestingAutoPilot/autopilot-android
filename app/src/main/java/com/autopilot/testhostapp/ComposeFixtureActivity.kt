@@ -15,12 +15,15 @@ import androidx.compose.material3.OutlinedTextField
 import androidx.compose.material3.Text
 import androidx.compose.material3.TextButton
 import androidx.compose.runtime.Composable
+import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableStateMapOf
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
 import androidx.compose.runtime.setValue
 import androidx.compose.ui.Modifier
+import androidx.compose.ui.node.RootForTest
+import androidx.compose.ui.platform.LocalView
 import androidx.compose.ui.semantics.contentDescription
 import androidx.compose.ui.semantics.semantics
 import androidx.compose.ui.unit.dp
@@ -46,11 +49,39 @@ class ComposeFixtureActivity : ComponentActivity() {
         super.onCreate(savedInstanceState)
         val mode = intent.getStringExtra("mode") ?: "dialog"
         setContent {
+            EnableUiAutomatorAccessibility()
             when (mode) {
                 "scroll" -> ScrollFixture()
                 "churn" -> ChurnDialog()
                 "wrapper" -> WrapperDialog()
                 else -> FixtureDialog()
+            }
+        }
+    }
+}
+
+/**
+ * Compose batches accessibility events; UiAutomator's scroll detection relies on
+ * those events, so on a headless / x86_64 emulator (CI) scrollUntil/scrollIntoView
+ * sees "no movement" and bails even though the list CAN scroll — the exact
+ * compose-scroll-fixture failure (list never moved in the CI dump). Forcing
+ * accessibility on and flushing the batch interval to 0 makes UiAutomator detect
+ * and drive the scroll reliably. (Documented Compose↔UiAutomator interop fix.)
+ *
+ * NOTE: this must be set in the APP UNDER TEST — an out-of-process UiAutomator run
+ * cannot enable it for an app it does not control. Real Compose apps that want
+ * reliable out-of-process scrolling (e.g. ScopeDOPE) must add the same override.
+ */
+@OptIn(androidx.compose.ui.ExperimentalComposeUiApi::class)
+@Composable
+private fun EnableUiAutomatorAccessibility() {
+    val view = LocalView.current
+    LaunchedEffect(view) {
+        (view as? RootForTest)?.let { root ->
+            try {
+                root.forceAccessibilityForTesting(true)
+                root.setAccessibilityEventBatchIntervalMillis(0L)
+            } catch (_: Throwable) {
             }
         }
     }
