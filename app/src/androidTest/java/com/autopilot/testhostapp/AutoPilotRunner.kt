@@ -456,14 +456,25 @@ class AutoPilotRunner(
         } catch (_: Exception) { "" }
     }
 
-    // Find the EditText (UiObject2) whose visible bounds are contained within the
-    // desc-matched node's bounds — the Compose input that visually belongs to the
-    // tagged wrapper even though it is not its UiAutomator child. Null if none.
+    // Find the EditText (UiObject2) that belongs to the desc-matched node — the
+    // Compose input that visually lives within the tagged wrapper even though it is
+    // not its UiAutomator child. Uses largest-INTERSECTION, not strict containment:
+    // when a field is scrolled to the viewport edge (e.g. a below-the-fold field
+    // brought into view on a short screen) either rect can be partially clipped, so
+    // strict `contains` returns null and the value reads '' (the CI-only
+    // compose-scroll-fixture failure). Pick the EditText with the most overlap with
+    // the desc bounds; require a non-trivial overlap so an unrelated field elsewhere
+    // is never matched.
     private fun editTextWithinBounds(descNode: UiObject): UiObject2? {
         return try {
             val outer = descNode.visibleBounds
             device.findObjects(By.clazz("android.widget.EditText"))
-                .firstOrNull { outer.contains(it.visibleBounds) }
+                .mapNotNull { et ->
+                    val r = android.graphics.Rect(et.visibleBounds)
+                    if (r.intersect(outer)) Pair(et, r.width().toLong() * r.height()) else null
+                }
+                .maxByOrNull { it.second }
+                ?.first
         } catch (_: Exception) { null }
     }
 
