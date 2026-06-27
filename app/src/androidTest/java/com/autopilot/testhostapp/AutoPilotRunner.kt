@@ -263,55 +263,63 @@ class AutoPilotRunner(
     private fun scrollIntoViewCompose(sel: SelectorJson) {
         val id = sel.identifier ?: sel.within?.identifier ?: return
         try {
-            // The IME squeezes a Compose list/dialog into the top fraction of the
-            // screen, so a deep item (LazyColumn virtualization → not composed until
-            // near the viewport) can't be scrolled to. Dismiss the keyboard first so
-            // the list reclaims its full height, then drive the scroll.
+            // The IME can squeeze a Compose list into the top fraction, so a deep
+            // (virtualized → not-yet-composed) item can't be scrolled to. Dismiss the
+            // keyboard first, then drive the scroll.
+            //
+            // CRITICAL (real-ScopeDOPE finding): each UiObject2.scroll() blocks on an
+            // a11y event; running it 15+15× per not-found target — especially when the
+            // target is genuinely ABSENT (e.g. a wrong id, or a control not on this
+            // screen) — hammers UiAutomation until it dies (DeadObjectException →
+            // Process crashed). So: STOP THE MOMENT A SCROLL MAKES NO PROGRESS
+            // (scroll() returns whether it moved), and cap hard.
+            //
+            // Drop the keyboard first so the list reclaims its full height before
+            // scrolling — otherwise the IME squeezes the scroll viewport so small
+            // that scroll() reports no-movement immediately and we bail before
+            // reaching a deep item. Use closeIme() (context-aware): on the host app
+            // it ESCs (safe on classic Views, reliably hides the keyboard); on an
+            // external app it does the dialog-safe IMM-hide only. forceDismissIme()
+            // is then a cheap no-op if the IME is already down.
+            closeIme()
             forceDismissIme()
             device.waitForIdle(800)
             if (device.hasObject(By.desc(id))) return
             val container = device.findObjects(By.scrollable(true))
                 .maxByOrNull { it.visibleBounds.width() * it.visibleBounds.height() }
-            if (container != null) {
-                container.setGestureMargin(container.visibleBounds.height() / 8)
-                // More iterations (a deep LazyColumn item can be many screens down)
-                // and a fuller scroll fraction so each step advances further.
-                repeat(15) {
+                ?: return  // nothing to scroll — don't thrash a non-scrollable screen
+            container.setGestureMargin(container.visibleBounds.height() / 8)
+            // Down to the end (stop as soon as scroll() reports no movement), then up.
+            for (dir in listOf(Direction.DOWN, Direction.UP)) {
+                var n = 0
+                while (n < 8) {
                     if (device.hasObject(By.desc(id))) return
-                    container.scroll(Direction.DOWN, 0.8f); Thread.sleep(120)
-                }
-                repeat(15) {
-                    if (device.hasObject(By.desc(id))) return
-                    container.scroll(Direction.UP, 0.8f); Thread.sleep(120)
+                    val moved = try { container.scroll(dir, 0.8f) } catch (_: Throwable) { return }
+                    Thread.sleep(120)
+                    if (!moved) break   // hit the end in this direction → stop scrolling it
+                    n++
                 }
                 if (device.hasObject(By.desc(id))) return
             }
-            // Bounds-based fallback (Compose scroll with no scrollable handle).
-            swipeScanForDesc(id)
+            // UiObject2.scroll() does not reliably move some Compose LazyColumns
+            // (it reports no-movement immediately though the list CAN scroll). A raw
+            // gesture swipe on the container DOES scroll it — verified on the scroll
+            // fixture where scroll() bailed but a swipe revealed the deep field. Use
+            // it as a BOUNDED fallback (no per-event a11y blocking, so no thrash
+            // crash): swipe within the container's own bounds, re-checking each time.
+            val b = container.visibleBounds
+            val cx = b.centerX()
+            val yLo = b.top + b.height() / 6
+            val yHi = b.bottom - b.height() / 6
+            for ((from, to) in listOf(yHi to yLo, yLo to yHi)) {  // reveal-below, then -above
+                repeat(8) {
+                    if (device.hasObject(By.desc(id))) return
+                    try { device.swipe(cx, from, cx, to, 30) } catch (_: Throwable) { return }
+                    Thread.sleep(140)
+                }
+                if (device.hasObject(By.desc(id))) return
+            }
         } catch (_: Throwable) {}
-    }
-
-    // Reveal an off-screen content-desc target by swiping the content area itself
-    // (no scrollable handle needed). Swipes within the middle band of the screen
-    // — above any keyboard, below the toolbar — re-checking after each. Up-swipes
-    // (reveal-below) first since growing lists push the add-row downward, then
-    // down-swipes. Returns as soon as the target appears.
-    private fun swipeScanForDesc(id: String) {
-        val w = device.displayWidth
-        val h = device.displayHeight
-        val x = w / 2
-        val top = (h * 0.30).toInt()      // below the app bar
-        val bottom = (h * 0.62).toInt()   // above where the IME would sit
-        repeat(8) {
-            if (device.hasObject(By.desc(id))) return
-            device.swipe(x, bottom, x, top, 24)   // content moves up → reveal below
-            Thread.sleep(150)
-        }
-        repeat(8) {
-            if (device.hasObject(By.desc(id))) return
-            device.swipe(x, top, x, bottom, 24)   // content moves down → reveal above
-            Thread.sleep(150)
-        }
     }
 
     private fun resolveElement(sel: SelectorJson): UiObject {
@@ -798,7 +806,33 @@ class AutoPilotRunner(
     // forceDismissIme(), invoked only on the rare not-found recovery path.
     private fun closeIme() {
         try {
-            device.executeShellCommand("input keyevent 111")  // ESCAPE
+            // CRITICAL (real-ScopeDOPE finding): KEYCODE_ESCAPE after a type was
+            // DISMISSING THE COMPOSE AlertDialog on the EXTERNAL app — Compose
+            // dialogs treat ESC as dismiss, so typing into caliberField closed the
+            // whole Add-Custom-Ammo form and every later field was "not found".
+            // BUT the bundled host app (TestHostApp, classic Views — no Compose
+            // dialog to dismiss) RELIES on ESC to drop the keyboard; without it the
+            // keyboard stays up and every later find thrashes recovery. So:
+            //   - host app  → ESC (safe + reliably drops the keyboard)
+            //   - external  → NO ESC; only the dialog-safe IMM-hide (which is a
+            //                 no-op when targetContext has no focused-view token,
+            //                 i.e. external apps — that's acceptable, recovery
+            //                 handles occlusion).
+            if (drivingHostApp) {
+                device.executeShellCommand("input keyevent 111")  // ESCAPE — safe on classic Views
+                Thread.sleep(150)
+                return
+            }
+            instrumentation.runOnMainSync {
+                try {
+                    val imm = instrumentation.targetContext
+                        .getSystemService(android.content.Context.INPUT_METHOD_SERVICE)
+                        as? android.view.inputmethod.InputMethodManager
+                    val token = (instrumentation.targetContext as? android.app.Activity)
+                        ?.currentFocus?.windowToken
+                    if (token != null) imm?.hideSoftInputFromWindow(token, 0)
+                } catch (_: Throwable) {}
+            }
             Thread.sleep(200)
         } catch (_: Exception) {}
     }
@@ -819,11 +853,11 @@ class AutoPilotRunner(
     private fun forceDismissIme() {
         try {
             if (!isImeShown()) return
-            device.executeShellCommand("input keyevent 111")  // ESCAPE — no back nav
-            Thread.sleep(150)
-            if (!isImeShown()) return
-            // InputMethodManager.hideSoftInputFromWindow on the focused view's
-            // window token — hides the IME without any back event.
+            // NOTE: do NOT send KEYCODE_ESCAPE here — Compose AlertDialogs treat ESC
+            // as DISMISS, so it closes the dialog (the real-ScopeDOPE bug: the assert
+            // on ammoSaveButton entered recovery, ESCAPE fired, the Add-Custom-Ammo
+            // dialog closed, every later field/button became "not found"). Hide the
+            // IME only via InputMethodManager.hideSoftInputFromWindow (no key/back).
             instrumentation.runOnMainSync {
                 try {
                     val imm = instrumentation.targetContext
@@ -835,7 +869,28 @@ class AutoPilotRunner(
                 } catch (_: Exception) {}
             }
             Thread.sleep(150)
-            // Whatever the IME state now, do NOT pressBack. Proceed.
+            if (!isImeShown()) return
+            // For an EXTERNAL app the IMM-hide above is a no-op (targetContext isn't
+            // its Activity, so no window token). Drop the keyboard by tapping a
+            // neutral spot near the top of the screen — the dialog title/empty area,
+            // above any input field — which defocuses the current field and dismisses
+            // the IME WITHOUT a Back/ESC (so a modal dialog stays open). This is what
+            // lets the keyboard-covered ammoSaveButton become visible to assert on.
+            // Do not tap to drop the keyboard: empirically (real ScopeDOPE) there is
+            // NO inert tap spot on this full-screen Compose form that hides the IME
+            // without also navigating away/closing the form — tapping outside the
+            // inset fields closes it; tapping the title doesn't defocus; Back/ESC
+            // navigate. This is the documented out-of-process limit. forceDismissIme
+            // therefore only does the safe IMM-hide above (a no-op for external
+            // apps). A control that stays keyboard-occluded (e.g. a Save button at
+            // the form's bottom) cannot be read while the IME is up — the plan must
+            // sequence so the keyboard is down before asserting it (e.g. assert it
+            // before typing, or after an action that drops focus).
+            // Do NOT pressBack even when the IME is still up: a Compose AlertDialog
+            // closes on Back regardless of the keyboard (verified on real ScopeDOPE —
+            // it dismissed the dialog and later type-over-bc/fix-bc failed). The
+            // neutral tap is the only dialog-safe keyboard dismissal; if it doesn't
+            // drop the IME, proceed and let the caller's resolve handle it.
         } catch (_: Exception) {}
     }
 
