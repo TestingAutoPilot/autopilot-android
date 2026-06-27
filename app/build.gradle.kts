@@ -58,6 +58,8 @@ dependencies {
 
     androidTestImplementation("androidx.test.ext:junit:1.2.1")
     androidTestImplementation("androidx.test.espresso:espresso-core:3.6.1")
-    androidTestImplementation("androidx.test.uiautomator:uiautomator:2.3.0")
+    // 2.4.0-alpha01 adds periodic accessibility-cache invalidation, fixing the
+    // out-of-process stale-node-after-Compose-recompose bug (find-after-type miss).
+    androidTestImplementation("androidx.test.uiautomator:uiautomator:2.4.0-alpha01")
     androidTestImplementation("com.google.code.gson:gson:2.11.0")
 }

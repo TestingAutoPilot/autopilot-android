@@ -187,7 +187,54 @@ class AutoPilotRunner(
             // Legacy fixture-oriented fallback (TestHostApp ScrollView paths).
             scrollIntoView(sel)
         }
-        return resolveElement(sel)
+        val finalObj = resolveElement(sel)
+        if (!finalObj.exists()) dumpFindFailure(sel)
+        return finalObj
+    }
+
+    // Captures exactly what the runner's UiAutomation sees at the instant of a
+    // failed find — the decisive diagnostic for the find-after-type gap (the
+    // external `uiautomator dump` view may differ from what the in-run query sees
+    // per-query, e.g. cache/recompose state). Logged under AutoPilotRunner with a
+    // FIND-FAIL-DUMP marker so CI logs / logcat can be grepped. (DOPE-free.)
+    private fun dumpFindFailure(sel: SelectorJson) {
+        try {
+            val id = sel.identifier ?: sel.within?.identifier
+            val log = StringBuilder()
+            log.append("FIND-FAIL-DUMP id=$id sel=$sel\n")
+            if (id != null) {
+                // What each query method sees for THIS id, right now.
+                val legacyDesc = device.findObject(UiSelector().description(id)).exists()
+                val o2Desc = device.findObject(By.desc(id))
+                val o2Res = device.findObject(By.res(id))
+                log.append("  legacy UiObject.description exists=$legacyDesc\n")
+                log.append("  UiObject2 By.desc=${o2Desc?.let { "FOUND class=${it.className} bounds=${it.visibleBounds}" } ?: "null"}\n")
+                log.append("  UiObject2 By.res =${o2Res?.let { "FOUND class=${it.className} bounds=${it.visibleBounds}" } ?: "null"}\n")
+            }
+            // Inventory of what IS in the tree the runner sees.
+            val descs = device.findObjects(By.desc(Pattern.compile(".+")))
+                .mapNotNull { try { it.contentDescription } catch (_: Throwable) { null } }
+            log.append("  content-descs visible to runner (${descs.size}): ${descs.joinToString(", ")}\n")
+            val edits = device.findObjects(By.clazz("android.widget.EditText"))
+            log.append("  EditTexts visible to runner (${edits.size}): " +
+                edits.joinToString(", ") { "[${it.visibleBounds}] text='${it.text ?: ""}'" } + "\n")
+            log.append("  scrollables present=${device.findObjects(By.scrollable(true)).isNotEmpty()}\n")
+            // Full hierarchy dump (what the runner's UiAutomation snapshot contains).
+            try {
+                val f = java.io.File(
+                    instrumentation.targetContext.externalCacheDir
+                        ?: instrumentation.targetContext.cacheDir,
+                    "find-fail-${id ?: "x"}-${SystemClock.uptimeMillis()}.xml"
+                )
+                device.dumpWindowHierarchy(f)
+                log.append("  full hierarchy → ${f.absolutePath}\n")
+            } catch (e: Throwable) {
+                log.append("  hierarchy dump failed: ${e.javaClass.simpleName}: ${e.message}\n")
+            }
+            android.util.Log.w("AutoPilotRunner", log.toString())
+        } catch (e: Throwable) {
+            android.util.Log.w("AutoPilotRunner", "FIND-FAIL-DUMP errored: ${e.message}")
+        }
     }
 
     // Gate the scroll/swipe recovery: it helps ONLY when there is a scrollable
