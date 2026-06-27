@@ -353,17 +353,24 @@ class AutoPilotRunner(
                     if (element.isChecked) "1" else "0"
                 "android.widget.ProgressBar" -> {
                     // The progress value lives on a sibling progressValueLabel
-                    // TextView that MainActivity keeps in sync. A one-shot read
-                    // intermittently caught it before the label surfaced/updated
-                    // (empty → flaky progress-assert-half, actual=''). Poll the
-                    // label for a non-empty value with a short deadline so a
-                    // transient miss doesn't propagate "".
+                    // TextView. The flake (progress-assert-half actual=''): the
+                    // legacy UiObject read a stale a11y snapshot AND the label can
+                    // be scrolled out of the viewport by the initial scrollToTop, so
+                    // it is genuinely absent from the queryable tree. Read via the
+                    // LIVE UiObject2 tree (By.desc), scrolling it into view first if
+                    // needed (same approach as the find-after-type fix), and poll
+                    // for a non-empty value.
                     var v = ""
-                    val deadline = SystemClock.uptimeMillis() + 2000L
+                    val deadline = SystemClock.uptimeMillis() + 3000L
                     while (SystemClock.uptimeMillis() < deadline) {
-                        val lbl = device.findObject(UiSelector().description("progressValueLabel"))
-                        v = if (lbl.exists()) (lbl.text ?: "") else ""
+                        var lbl = device.findObject(By.desc("progressValueLabel"))
+                        if (lbl == null) {
+                            scrollIntoView(SelectorJson(identifier = "progressValueLabel"))
+                            lbl = device.findObject(By.desc("progressValueLabel"))
+                        }
+                        v = lbl?.text ?: ""
                         if (v.isNotEmpty()) break
+                        device.waitForIdle(500)
                         Thread.sleep(100)
                     }
                     v
