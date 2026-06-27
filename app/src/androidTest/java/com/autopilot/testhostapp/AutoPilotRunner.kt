@@ -285,42 +285,47 @@ class AutoPilotRunner(
             forceDismissIme()
             device.waitForIdle(800)
             if (device.hasObject(By.desc(id))) return
+
+            // PRIMARY (headless-robust): UiScrollable drives the scroll via
+            // accessibility ACTION_SCROLL_FORWARD/BACKWARD, NOT a synthetic touch
+            // gesture. Raw gestures (UiObject2.scroll / device.swipe) DO NOT move a
+            // Compose LazyColumn in CI's HEADLESS emulator (verified: the list never
+            // moved on CI) — scroll is a basic capability and must use the API that
+            // actually works headless. UiScrollable targets ANY node reporting
+            // scrollable=true (a Compose LazyColumn does), not just ScrollView.
+            try {
+                val scrollable = UiScrollable(UiSelector().scrollable(true))
+                scrollable.setMaxSearchSwipes(20)
+                if (scrollable.exists()) {
+                    // scrollIntoView issues accessibility scroll actions until the
+                    // descriptor is on screen or the list end is reached.
+                    val found = scrollable.scrollIntoView(UiSelector().description(id))
+                    device.waitForIdle(400)
+                    if (found || device.hasObject(By.desc(id))) return
+                    // Not found scrolling down → try from the other end.
+                    scrollable.scrollToBeginning(20)
+                    device.waitForIdle(400)
+                    if (device.hasObject(By.desc(id))) return
+                    scrollable.scrollIntoView(UiSelector().description(id))
+                    device.waitForIdle(400)
+                    if (device.hasObject(By.desc(id))) return
+                }
+            } catch (_: Throwable) {}
+
+            // FALLBACK (local/interactive where gestures DO work): bounded
+            // UiObject2.scroll, stop on no-movement, cap hard — no thrash crash.
             val container = device.findObjects(By.scrollable(true))
                 .maxByOrNull { it.visibleBounds.width() * it.visibleBounds.height() }
-                ?: return  // nothing to scroll — don't thrash a non-scrollable screen
+                ?: return
             container.setGestureMargin(container.visibleBounds.height() / 8)
-            // Down to the end (stop as soon as scroll() reports no movement), then up.
             for (dir in listOf(Direction.DOWN, Direction.UP)) {
                 var n = 0
                 while (n < 8) {
                     if (device.hasObject(By.desc(id))) return
                     val moved = try { container.scroll(dir, 0.8f) } catch (_: Throwable) { return }
                     Thread.sleep(120)
-                    if (!moved) break   // hit the end in this direction → stop scrolling it
+                    if (!moved) break
                     n++
-                }
-                if (device.hasObject(By.desc(id))) return
-            }
-            // UiObject2.scroll() does not reliably move some Compose LazyColumns
-            // (it reports no-movement immediately though the list CAN scroll). A raw
-            // gesture swipe DOES scroll it — verified on the scroll fixture where
-            // scroll() bailed but a swipe revealed the deep field. Use it as a
-            // BOUNDED fallback (no per-event a11y blocking, so no thrash crash).
-            //
-            // Anchor the swipe to the CONTENT BAND ABOVE THE KEYBOARD using the
-            // SCREEN, not the container's visibleBounds: the IME squeezes the
-            // container so its bounds give a tiny (ineffective) swipe span. The
-            // keyboard occupies roughly the bottom ~45% on a dense small screen
-            // (CI's pixel_5/api-30), so swipe between ~18% and ~50% of the display
-            // height — a long pull entirely in the visible, non-keyboard area.
-            val cx = device.displayWidth / 2
-            val yLo = (device.displayHeight * 0.18).toInt()
-            val yHi = (device.displayHeight * 0.50).toInt()
-            for ((from, to) in listOf(yHi to yLo, yLo to yHi)) {  // reveal-below, then -above
-                repeat(8) {
-                    if (device.hasObject(By.desc(id))) return
-                    try { device.swipe(cx, from, cx, to, 30) } catch (_: Throwable) { return }
-                    Thread.sleep(140)
                 }
                 if (device.hasObject(By.desc(id))) return
             }
@@ -376,6 +381,31 @@ class AutoPilotRunner(
                 else -> {}
             }
         } catch (_: Exception) {}
+
+        // The target may live in a NESTED scrollable (e.g. scroll-end is inside the
+        // inner R.id.scrollView, instance(1), NOT the outer page ScrollView). Scrolling
+        // only instance(0) never reveals it. Drive EVERY scrollable container via the
+        // accessibility-based UiScrollable (ACTION_SCROLL_* — works headless, where
+        // synthetic gestures do not) until the target is on screen.
+        if (sel.identifier != null && !device.hasObject(By.desc(sel.identifier))) {
+            val target = UiSelector().description(sel.identifier)
+            // Try by the inner scrollable's own content-description first, then by
+            // scrollable index, so we scroll the container that actually holds it.
+            val candidates = listOf(
+                UiScrollable(UiSelector().description("scrollView")),
+                UiScrollable(UiSelector().scrollable(true).instance(1)),
+                UiScrollable(UiSelector().scrollable(true).instance(0)),
+                UiScrollable(UiSelector().scrollable(true))
+            )
+            for (sc in candidates) {
+                if (device.hasObject(By.desc(sel.identifier))) break
+                try {
+                    sc.setMaxSearchSwipes(20)
+                    if (sc.exists()) sc.scrollIntoView(target)
+                    device.waitForIdle(300)
+                } catch (_: Throwable) {}
+            }
+        }
 
         // If still not found (e.g. disabled view that UiScrollable skips), brute-force swipe
         // outside the nested scrollView bounds so the outer ScrollView receives the gesture.
@@ -572,20 +602,24 @@ class AutoPilotRunner(
             }
             sel.identifier != null -> {
                 if (present) {
-                    // If not immediately visible, try scrolling it into view.
-                    // For scroll-end specifically, also scroll the inner scrollView to bottom
-                    // so the view is physically visible before UiAutomator queries the tree.
+                    // If not immediately visible, scroll it into view. Use the
+                    // accessibility-driven UiScrollable path (ACTION_SCROLL_* — works
+                    // headless, where synthetic gestures may not). For host-app views
+                    // in a deeply-nested / pathologically-short ScrollView (the
+                    // fixture's inner scrollView is only ~90px tall, so gesture swipes
+                    // barely move), ALSO drive the View's own programmatic scroll
+                    // (fullScroll) — verified to reach scroll-end on CI. Keep BOTH:
+                    // the programmatic scroll handles the short nested ScrollView, the
+                    // UiScrollable path handles everything else incl. Compose.
                     if (!device.hasObject(By.desc(sel.identifier))) {
-                        if (sel.identifier == "scroll-end") {
-                            // Programmatically scroll inner ScrollView to bottom on the main thread —
-                            // guaranteed to make scroll-end physically visible regardless of a11y tree state.
+                        if (drivingHostApp && MainActivity.instance != null) {
                             instrumentation.runOnMainSync {
-                                MainActivity.instance?.scrollInnerScrollViewToEnd()
+                                MainActivity.instance?.scrollViewToDescendant(sel.identifier!!)
                             }
-                            Thread.sleep(300)
-                        } else {
-                            scrollIntoView(sel)
+                            device.waitForIdle(400)
                         }
+                        if (!device.hasObject(By.desc(sel.identifier))) scrollIntoView(sel)
+                        if (!device.hasObject(By.desc(sel.identifier))) scrollIntoViewCompose(sel)
                     }
                     val ok = device.wait(Until.hasObject(By.desc(sel.identifier)), timeout)
                     StepResult(id, passed = ok, skipped = false,

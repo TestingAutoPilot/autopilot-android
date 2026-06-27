@@ -89,6 +89,18 @@ class MainActivity : AppCompatActivity() {
         sv?.fullScroll(android.view.View.FOCUS_DOWN)
     }
 
+    // General: bring a descendant (matched by contentDescription) into view by
+    // asking its nearest scrolling ancestor to scroll to it. Works for any nested
+    // ScrollView regardless of how short its viewport is (no gesture needed) — the
+    // robust way to reach an off-screen child of a small/nested ScrollView, which
+    // synthetic swipes traverse only slowly. No-op if not found.
+    fun scrollViewToDescendant(contentDesc: String) {
+        val target = findViewByDesc(window.decorView, contentDesc) ?: return
+        target.requestRectangleOnScreen(
+            android.graphics.Rect(0, 0, target.width, target.height), true
+        )
+    }
+
     // Called from instrumented tests to simulate a double-tap on dblButton.
     fun simulateDoubleTap(contentDesc: String) {
         if (contentDesc == "dblButton") {
