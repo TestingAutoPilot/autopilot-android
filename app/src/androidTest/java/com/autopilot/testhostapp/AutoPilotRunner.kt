@@ -28,7 +28,11 @@ import java.io.InputStreamReader
  */
 class AutoPilotRunner(
     private val planPath: String? = null,
-    private val targetPackageOverride: String? = null
+    private val targetPackageOverride: String? = null,
+    // Optional bundled-asset plan name (e.g. "compose-fixture.json"). When set,
+    // loads that asset instead of the default unified plan — used by in-repo
+    // fixtures. planPath (an external device path) still takes precedence.
+    private val assetName: String? = null
 ) {
 
     private val instrumentation = InstrumentationRegistry.getInstrumentation()
@@ -48,12 +52,13 @@ class AutoPilotRunner(
     // ── Plan loading ────────────────────────────────────────────────────────
 
     private fun loadPlan(): Plan {
-        val reader = if (planPath != null) {
+        val reader = when {
             // External plan pushed to the device (adb push … ; -e plan <path>).
-            InputStreamReader(File(planPath).inputStream())
-        } else {
-            // Bundled mode: the plan packaged in this test APK's assets.
-            InputStreamReader(instrumentation.context.assets.open("test-all-capabilities.json"))
+            planPath != null -> InputStreamReader(File(planPath).inputStream())
+            // A named bundled asset (in-repo fixtures, e.g. "compose-fixture.json").
+            assetName != null -> InputStreamReader(instrumentation.context.assets.open(assetName))
+            // Default bundled mode: the unified plan packaged in this test APK.
+            else -> InputStreamReader(instrumentation.context.assets.open("test-all-capabilities.json"))
         }
         return Gson().fromJson(reader, Plan::class.java)
     }
@@ -124,7 +129,9 @@ class AutoPilotRunner(
         grantDeclaredPermissions(plan)   // grant up front so dialogs never appear
         launchTargetApp()
         val timeout = plan.defaults?.timeoutMs ?: defaultTimeout()
-        if (drivingHostApp) scrollToTop()  // fixture-only; never on an external app
+        // MainActivity-specific top-scroll for the unified plan; skip for host-app
+        // plans that drive a different surface (e.g. the Compose fixture dialog).
+        if (drivingHostApp && plan.defaults?.skipInitialScroll != true) scrollToTop()
         return plan.steps.map { step ->
             // A permission dialog can surface on screen entry mid-plan; clear it
             // (opt-in) before the step interacts with the now-covered UI.
@@ -149,26 +156,53 @@ class AutoPilotRunner(
     private fun findElement(sel: SelectorJson): UiObject {
         var obj = resolveElement(sel)
         if (obj.exists()) return obj
-        // Brief settle + retry first — a just-raised IME can momentarily disrupt
-        // the query for a field that is actually on-screen (Round-4 evidence:
-        // nameField was visible yet first resolve missed it). Cheapest recovery.
-        Thread.sleep(200)
-        obj = resolveElement(sel)
-        if (obj.exists()) return obj
-        // (DOPE-70/71/72/73, DOPE-76) Still not found. Two causes, handled in order:
-        //  3a) the soft keyboard is covering it — dismiss the IME NON-DESTRUCTIVELY
-        //      (never pressBack: it would close a modal dialog);
-        //  3b) dynamic content (a growing list / Compose scroll) pushed it below
-        //      the fold — scroll it back (handle-based, else bounds-based swipes).
+        // THE common Compose case (find-after-type staleness): the node is present
+        // and visible, but the legacy UiObject query read a stale/flattened
+        // AccessibilityNodeInfo snapshot taken before a Compose recomposition (and
+        // the IME-dismiss) settled — e.g. immediately after typing into a sibling
+        // OutlinedTextField whose contentDescription sits on a non-focusable
+        // android.view.View wrapper. Wait on the LIVE a11y tree via UiObject2/By,
+        // which tracks the current AccessibilityNodeInfo, then re-resolve. This
+        // resolves it WITHOUT any IME dismiss or scrolling.
+        sel.identifier?.let { id ->
+            device.waitForIdle(2000)
+            if (device.wait(Until.hasObject(By.desc(id)), 3000L) != null) {
+                obj = resolveElement(sel)
+                if (obj.exists()) return obj
+            }
+        }
+        // Still not found → the target may be keyboard-covered or off-viewport.
+        //  - dismiss the IME NON-DESTRUCTIVELY (never pressBack: it would close a
+        //    modal dialog);
         forceDismissIme()
         obj = resolveElement(sel)
         if (obj.exists()) return obj
-        scrollIntoViewCompose(sel)
-        obj = resolveElement(sel)
-        if (obj.exists()) return obj
-        // Legacy fixture-oriented fallback (TestHostApp ScrollView paths).
-        scrollIntoView(sel)
+        //  - bring an off-viewport target back. Only scroll/swipe when it can
+        //    actually help (a scrollable container exists, or the node is off the
+        //    viewport) — never thrash a fixed, non-scrollable dialog.
+        if (shouldAttemptScroll(sel)) {
+            scrollIntoViewCompose(sel)
+            obj = resolveElement(sel)
+            if (obj.exists()) return obj
+            // Legacy fixture-oriented fallback (TestHostApp ScrollView paths).
+            scrollIntoView(sel)
+        }
         return resolveElement(sel)
+    }
+
+    // Gate the scroll/swipe recovery: it helps ONLY when there is a scrollable
+    // container to drive, OR the target exists in the tree but its bounds are
+    // outside the viewport. If the target is absent AND there is no scrollable
+    // container (a fixed dialog — the ammo Add-Custom-Ammo case), swiping moves
+    // nothing and just wastes time (and can mask a find-after-type miss), so skip.
+    private fun shouldAttemptScroll(sel: SelectorJson): Boolean {
+        return try {
+            if (device.findObjects(By.scrollable(true)).isNotEmpty()) return true
+            val id = sel.identifier ?: sel.within?.identifier ?: return false
+            val node = device.findObject(By.desc(id)) ?: return false
+            val screen = android.graphics.Rect(0, 0, device.displayWidth, device.displayHeight)
+            !screen.contains(node.visibleBounds)
+        } catch (_: Throwable) { false }
     }
 
     // (DOPE-76) Compose-friendly scroll-into-view. Compose scroll containers
@@ -319,17 +353,24 @@ class AutoPilotRunner(
                     if (element.isChecked) "1" else "0"
                 "android.widget.ProgressBar" -> {
                     // The progress value lives on a sibling progressValueLabel
-                    // TextView that MainActivity keeps in sync. A one-shot read
-                    // intermittently caught it before the label surfaced/updated
-                    // (empty → flaky progress-assert-half, actual=''). Poll the
-                    // label for a non-empty value with a short deadline so a
-                    // transient miss doesn't propagate "".
+                    // TextView. The flake (progress-assert-half actual=''): the
+                    // legacy UiObject read a stale a11y snapshot AND the label can
+                    // be scrolled out of the viewport by the initial scrollToTop, so
+                    // it is genuinely absent from the queryable tree. Read via the
+                    // LIVE UiObject2 tree (By.desc), scrolling it into view first if
+                    // needed (same approach as the find-after-type fix), and poll
+                    // for a non-empty value.
                     var v = ""
-                    val deadline = SystemClock.uptimeMillis() + 2000L
+                    val deadline = SystemClock.uptimeMillis() + 3000L
                     while (SystemClock.uptimeMillis() < deadline) {
-                        val lbl = device.findObject(UiSelector().description("progressValueLabel"))
-                        v = if (lbl.exists()) (lbl.text ?: "") else ""
+                        var lbl = device.findObject(By.desc("progressValueLabel"))
+                        if (lbl == null) {
+                            scrollIntoView(SelectorJson(identifier = "progressValueLabel"))
+                            lbl = device.findObject(By.desc("progressValueLabel"))
+                        }
+                        v = lbl?.text ?: ""
                         if (v.isNotEmpty()) break
+                        device.waitForIdle(500)
                         Thread.sleep(100)
                     }
                     v
@@ -353,10 +394,18 @@ class AutoPilotRunner(
     // Returns "" when neither resolves, so classic-View behavior is unchanged.
     private fun composeFieldValue(element: UiObject): String {
         return try {
-            val focused = device.findObject(By.focused(true).clazz("android.widget.EditText"))
-            if (focused?.text?.isNotEmpty() == true) return focused.text
+            // FIELD-SPECIFIC first: the EditText whose bounds sit within THIS
+            // desc-matched node's bounds. (Reading By.focused(true) first was the
+            // bug — it returns whatever field currently holds focus, so after
+            // typing A→B→C every field read back C's value. The Compose fixture
+            // caught this: assert-A and assert-B both read the last-typed value.)
             val inner = editTextWithinBounds(element)
-            inner?.text?.takeIf { it.isNotEmpty() } ?: ""
+            inner?.text?.takeIf { it.isNotEmpty() }?.let { return it }
+            // Fallback: only when no EditText maps to this node's bounds, fall back
+            // to the focused field (covers single-field screens where bounds may
+            // not enclose the input).
+            val focused = device.findObject(By.focused(true).clazz("android.widget.EditText"))
+            focused?.text?.takeIf { it.isNotEmpty() } ?: ""
         } catch (_: Exception) { "" }
     }
 
@@ -608,6 +657,7 @@ class AutoPilotRunner(
         instrumentation.sendStringSync(finalText)
         Thread.sleep(400)
         closeIme()
+        device.waitForIdle(2000)  // let the Compose recompose settle before the next lookup
         return StepResult(id, passed = true, skipped = false)
     }
 
@@ -624,6 +674,7 @@ class AutoPilotRunner(
         instrumentation.sendStringSync(text)
         Thread.sleep(400)
         closeIme()
+        device.waitForIdle(2000)  // let the Compose recompose settle before the next lookup
         return StepResult(id, passed = true, skipped = false)
     }
 
@@ -840,18 +891,22 @@ class AutoPilotRunner(
         }
 
         val element = findElement(sel)
-        // Poll up to 3s for the value to satisfy the condition — handles async UI updates
-        // after popup dismissal, menu clicks, link taps, and alert confirms.
+        // Poll up to 5s for the value to satisfy the condition — handles async UI
+        // updates after popup dismissal, menu clicks, link taps, alert confirms,
+        // and a not-yet-synced ProgressBar value label on a slow CI emulator. An
+        // EMPTY read ('') is treated as "not ready, keep polling" (never compared)
+        // — that empty value reaching compare() was the flaky progress-assert-half.
         val actual = if (expected.isNotEmpty() && op in listOf("equals","contains","matches","greaterThan","lessThan")) {
-            val deadline = SystemClock.uptimeMillis() + 3000L
+            val deadline = SystemClock.uptimeMillis() + 5000L
             var v = readValue(element)
             while (SystemClock.uptimeMillis() < deadline) {
-                val satisfies = when (op) {
-                    "equals"      -> v == expected
-                    "contains"    -> v.contains(expected)
-                    "matches"     -> v.matches(Regex(expected))
-                    "greaterThan" -> (v.toDoubleOrNull() ?: 0.0) > (expected.toDoubleOrNull() ?: 0.0)
-                    "lessThan"    -> (v.toDoubleOrNull() ?: 0.0) < (expected.toDoubleOrNull() ?: 0.0)
+                val satisfies = when {
+                    v.isEmpty()         -> false   // not ready yet — keep polling, don't compare ''
+                    op == "equals"      -> v == expected
+                    op == "contains"    -> v.contains(expected)
+                    op == "matches"     -> v.matches(Regex(expected))
+                    op == "greaterThan" -> (v.toDoubleOrNull() ?: 0.0) > (expected.toDoubleOrNull() ?: 0.0)
+                    op == "lessThan"    -> (v.toDoubleOrNull() ?: 0.0) < (expected.toDoubleOrNull() ?: 0.0)
                     else -> true
                 }
                 if (satisfies) break
