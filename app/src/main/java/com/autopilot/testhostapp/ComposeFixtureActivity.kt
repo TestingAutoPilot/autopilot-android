@@ -49,6 +49,7 @@ class ComposeFixtureActivity : ComponentActivity() {
             when (mode) {
                 "scroll" -> ScrollFixture()
                 "churn" -> ChurnDialog()
+                "wrapper" -> WrapperDialog()
                 else -> FixtureDialog()
             }
         }
@@ -133,6 +134,50 @@ private fun ChurnDialog() {
                     label = { Text("C $sum") }, modifier = Modifier.descTag("churnFieldC"))
                 OutlinedTextField(d, { d = it }, isError = d.isEmpty(),
                     label = { Text("D $sum") }, modifier = Modifier.descTag("churnFieldD"))
+            }
+        }
+    )
+}
+
+/**
+ * Wrapper variant: the contentDescription is set on a Column WRAPPING each
+ * OutlinedTextField (not on the field itself), so ContentDescription merges onto
+ * the wrapper ancestor — a non-focusable android.view.View DISTINCT from the inner
+ * EditText. This is ScopeDOPE's actual shape (their dump showed the desc on a
+ * separate View node, not the EditText), which the other fixtures (desc directly
+ * on the field) do NOT reproduce. find-after-type: type wrapperFieldA, then find
+ * sibling wrapperFieldB by the wrapper desc and read its value (must come from the
+ * inner EditText, not the wrapper).
+ */
+@Composable
+private fun WrapperDialog() {
+    var a by remember { mutableStateOf("") }
+    var b by remember { mutableStateOf("") }
+    var c by remember { mutableStateOf("") }
+    var open by remember { mutableStateOf(true) }
+    if (!open) return
+
+    AlertDialog(
+        onDismissRequest = { },
+        confirmButton = {
+            TextButton(onClick = { open = false }, modifier = Modifier.descTag("wrapperSaveButton")) {
+                Text("Save")
+            }
+        },
+        title = { Text("Wrapper Fixture") },
+        text = {
+            Column(modifier = Modifier.imePadding().padding(4.dp)) {
+                // desc on the WRAPPING Column, NOT on the field → merges onto a
+                // non-field ancestor View (ScopeDOPE shape).
+                Column(modifier = Modifier.descTag("wrapperFieldA")) {
+                    OutlinedTextField(a, { a = it }, label = { Text("A") })
+                }
+                Column(modifier = Modifier.descTag("wrapperFieldB")) {
+                    OutlinedTextField(b, { b = it }, label = { Text("B") })
+                }
+                Column(modifier = Modifier.descTag("wrapperFieldC")) {
+                    OutlinedTextField(c, { c = it }, label = { Text("C") })
+                }
             }
         }
     )

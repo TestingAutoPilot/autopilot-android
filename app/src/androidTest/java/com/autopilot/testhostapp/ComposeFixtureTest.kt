@@ -43,6 +43,7 @@ class ComposeFixtureTest {
         val mode = when {
             asset.contains("scroll") -> "scroll"
             asset.contains("churn") -> "churn"
+            asset.contains("wrapper") -> "wrapper"
             else -> "dialog"
         }
         val device = launch(mode)
@@ -77,5 +78,10 @@ class ComposeFixtureTest {
     @Test
     fun composeChurnFindPlan() {
         runPlanAndAssert("compose-churn-fixture.json", "churnFieldA")
+    }
+
+    @Test
+    fun composeWrapperFindPlan() {
+        runPlanAndAssert("compose-wrapper-fixture.json", "wrapperFieldA")
     }
 }
