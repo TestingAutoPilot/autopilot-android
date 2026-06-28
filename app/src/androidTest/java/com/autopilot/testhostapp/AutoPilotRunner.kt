@@ -2,6 +2,7 @@ package com.autopilot.testhostapp
 
 import android.os.SystemClock
 import android.view.KeyEvent
+import android.view.accessibility.AccessibilityNodeInfo
 import androidx.test.platform.app.InstrumentationRegistry
 import androidx.test.uiautomator.*
 import com.google.gson.Gson
@@ -288,6 +289,65 @@ class AutoPilotRunner(
     //  2. Otherwise fall back to BOUNDS-BASED swipes on the content area —
     //     swipe up to reveal content below, then down, re-checking for the target
     //     by content-desc between swipes. This needs no scrollable handle.
+    // Scroll a (Compose LazyColumn or any) scrollable into the target by performing
+    // the ACTION_SCROLL_FORWARD/BACKWARD accessibility action DIRECTLY on the
+    // scrollable node — NOT a synthetic touch gesture. This is the gesture-free
+    // primitive that works on CI's AOSP x86 image, where gestures both fail to move
+    // the list and corrupt the a11y tree (see scrollIntoViewCompose for the full
+    // finding). Returns true once By.desc(id) is present, false if exhausted.
+    private fun scrollByAccessibilityAction(id: String, maxSteps: Int = 14): Boolean {
+        // Find the scrollable node in the active window that actually exposes a
+        // forward/backward scroll action.
+        fun scrollableNode(): AccessibilityNodeInfo? {
+            val root = try { instrumentation.uiAutomation.rootInActiveWindow } catch (_: Throwable) { null }
+                ?: return null
+            val stack = ArrayDeque<AccessibilityNodeInfo>()
+            stack.addLast(root)
+            var best: AccessibilityNodeInfo? = null
+            while (stack.isNotEmpty()) {
+                val n = stack.removeLast()
+                try {
+                    if (n.isScrollable && n.actionList.any {
+                            it.id == AccessibilityNodeInfo.ACTION_SCROLL_FORWARD ||
+                            it.id == AccessibilityNodeInfo.ACTION_SCROLL_BACKWARD
+                        }) {
+                        // Prefer the largest scrollable (the list, not a tiny inner one).
+                        if (best == null) best = n
+                    }
+                } catch (_: Throwable) {}
+                for (i in 0 until n.childCount) (try { n.getChild(i) } catch (_: Throwable) { null })?.let { stack.addLast(it) }
+            }
+            return best
+        }
+
+        fun act(action: Int): Boolean {
+            val node = scrollableNode() ?: return false
+            return try { node.performAction(action) } catch (_: Throwable) { false }
+        }
+
+        if (device.hasObject(By.desc(id))) return true
+        // Scroll forward (down) until the target appears or the action stops moving.
+        var steps = 0
+        while (steps < maxSteps) {
+            if (!act(AccessibilityNodeInfo.ACTION_SCROLL_FORWARD)) break
+            device.waitForIdle(400)
+            Thread.sleep(120)
+            if (device.hasObject(By.desc(id))) return true
+            steps++
+        }
+        // Not found going down → rewind to the top and try again (the target may
+        // have been above the start position).
+        steps = 0
+        while (steps < maxSteps) {
+            if (!act(AccessibilityNodeInfo.ACTION_SCROLL_BACKWARD)) break
+            device.waitForIdle(400)
+            Thread.sleep(120)
+            if (device.hasObject(By.desc(id))) return true
+            steps++
+        }
+        return device.hasObject(By.desc(id))
+    }
+
     private fun scrollIntoViewCompose(sel: SelectorJson) {
         val id = sel.identifier ?: sel.within?.identifier ?: return
         try {
@@ -314,31 +374,24 @@ class AutoPilotRunner(
             device.waitForIdle(800)
             if (device.hasObject(By.desc(id))) return
 
-            // PRIMARY (headless-robust): UiScrollable drives the scroll via
-            // accessibility ACTION_SCROLL_FORWARD/BACKWARD, NOT a synthetic touch
-            // gesture. Raw gestures (UiObject2.scroll / device.swipe) DO NOT move a
-            // Compose LazyColumn in CI's HEADLESS emulator (verified: the list never
-            // moved on CI) — scroll is a basic capability and must use the API that
-            // actually works headless. UiScrollable targets ANY node reporting
-            // scrollable=true (a Compose LazyColumn does), not just ScrollView.
-            try {
-                val scrollable = UiScrollable(UiSelector().scrollable(true))
-                scrollable.setMaxSearchSwipes(20)
-                if (scrollable.exists()) {
-                    // scrollIntoView issues accessibility scroll actions until the
-                    // descriptor is on screen or the list end is reached.
-                    val found = scrollable.scrollIntoView(UiSelector().description(id))
-                    device.waitForIdle(400)
-                    if (found || device.hasObject(By.desc(id))) return
-                    // Not found scrolling down → try from the other end.
-                    scrollable.scrollToBeginning(20)
-                    device.waitForIdle(400)
-                    if (device.hasObject(By.desc(id))) return
-                    scrollable.scrollIntoView(UiSelector().description(id))
-                    device.waitForIdle(400)
-                    if (device.hasObject(By.desc(id))) return
-                }
-            } catch (_: Throwable) {}
+            // PRIMARY (the only thing that works on CI's AOSP x86 image):
+            // dispatch the real ACTION_SCROLL_FORWARD/BACKWARD accessibility action
+            // DIRECTLY on the scrollable node — gesture-free.
+            //
+            // CRITICAL finding, reproduced on CI's exact image (system-images;
+            // android-30;default;x86_64) on an x86 host: UiScrollable.scrollIntoView
+            // and UiObject2.scroll/device.swipe all perform a SYNTHETIC TOUCH GESTURE
+            // ("Scrolling backward ... in 55 steps" in logcat), NOT the accessibility
+            // action — despite the misleading older comment here. On the AOSP image
+            // that gesture (a) does NOT move the Compose LazyColumn (its bounds never
+            // change in the dump) AND (b) CORRUPTS the accessibility tree: after a
+            // single synthetic swipe, `uiautomator dump` returns empty until the
+            // activity restarts, so every later find fails ("scrollFieldLow not
+            // found"). The LazyColumn DOES expose ACTION_SCROLL_FORWARD; performing
+            // that action on the node moves the list without a gesture and without
+            // breaking the tree. (google_apis images tolerate the gesture, which is
+            // why this only ever failed on CI's default/AOSP image.)
+            if (scrollByAccessibilityAction(id)) return
 
             // FALLBACK (local/interactive where gestures DO work): bounded
             // UiObject2.scroll, stop on no-movement, cap hard — no thrash crash.
@@ -928,10 +981,20 @@ class AutoPilotRunner(
             // BUT the bundled host app (TestHostApp, classic Views — no Compose
             // dialog to dismiss) RELIES on ESC to drop the keyboard; without it the
             // keyboard stays up and every later find thrashes recovery. So:
-            //   - host app  → ESC (safe + reliably drops the keyboard)
+            //   - host app  → ESC (safe + reliably drops the keyboard for the
+            //     classic-View TestHostApp). BUT the bundled Compose fixtures
+            //     (ComposeFixtureActivity) are ALSO drivingHostApp and a Compose
+            //     OutlinedTextField does NOT drop its IME on ESC (verified: ESC
+            //     leaves mInputShown=true on the scroll fixture). A keyboard left up
+            //     squeezes the LazyColumn so the deep field can't be reached
+            //     (compose-scroll-fixture: scrollFieldLow below the fold). So if ESC
+            //     leaves the IME up, drop it with a guarded Back — safe because the
+            //     IME consumes the first Back while shown (the fixture is not a
+            //     Back-dismissable dialog, and even a dialog would stay open).
             if (drivingHostApp) {
                 device.executeShellCommand("input keyevent 111")  // ESCAPE — safe on classic Views
                 Thread.sleep(150)
+                if (isImeShown()) { device.pressBack(); Thread.sleep(200) }
                 return
             }
             //   - external → a window-token IMM-hide can NEVER work (targetContext is
