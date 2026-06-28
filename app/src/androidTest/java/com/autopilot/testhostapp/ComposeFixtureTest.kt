@@ -11,54 +11,77 @@ import org.junit.Test
 import org.junit.runner.RunWith
 
 /**
- * Runs the compose-fixture plan against ComposeFixtureActivity — OutlinedTextFields
- * in a non-scrollable AlertDialog whose contentDescription sits on a non-focusable
- * android.view.View wrapper (the ScopeDOPE shape). Reproduces the find-after-type
- * case (type field A, then immediately find+type sibling field B) under the CI 5x
- * gate, so a regression of that fix fails CI here instead of only on a ScopeDOPE run.
+ * Drives the Compose fixtures (ComposeFixtureActivity) under the CI 5x gate so the
+ * Compose automation shapes are caught HERE, not on a downstream real-app run.
+ *
+ *  - composeFindAfterTypePlan: non-scrollable AlertDialog, sibling find-after-type.
+ *  - composeScrollFindPlan: scrollable LazyColumn, find a below-the-fold field after
+ *    typing — reproduces the real ScopeDOPE ammo-dialog shape. On a failed find the
+ *    runner logs FIND-FAIL-DUMP (what the runner's UiAutomation sees vs external).
  */
 @RunWith(AndroidJUnit4::class)
 class ComposeFixtureTest {
 
-    @Test
-    fun composeFindAfterTypePlan() {
+    private fun launch(mode: String): UiDevice {
         val instr = InstrumentationRegistry.getInstrumentation()
         val device = UiDevice.getInstance(instr)
-
-        // Launch the Compose fixture activity (not the launcher MainActivity).
-        // Use targetContext (the app-under-test's context) — starting an activity
-        // in the target app from the TEST package's context is a cross-uid
-        // SecurityException.
         val intent = Intent().apply {
             setClassName(
                 "com.autopilot.testhostapp",
                 "com.autopilot.testhostapp.ComposeFixtureActivity"
             )
             addFlags(Intent.FLAG_ACTIVITY_NEW_TASK or Intent.FLAG_ACTIVITY_CLEAR_TASK)
+            putExtra("mode", mode)
         }
+        // targetContext (app-under-test) — starting it from the test context is a
+        // cross-uid SecurityException.
         instr.targetContext.startActivity(intent)
-        // Wait for the dialog's first field to appear before the plan runs.
-        device.wait(Until.hasObject(By.desc("fixtureFieldA")), 10_000L)
+        return device
+    }
 
-        // The runner drives by content-desc system-wide; targetPackageOverride keeps
-        // it pointed at this host app (so it does NOT relaunch the launcher activity).
+    private fun runPlanAndAssert(asset: String, firstFieldDesc: String) {
+        val mode = when {
+            asset.contains("scroll") -> "scroll"
+            asset.contains("churn") -> "churn"
+            asset.contains("wrapper") -> "wrapper"
+            else -> "dialog"
+        }
+        val device = launch(mode)
+        device.wait(Until.hasObject(By.desc(firstFieldDesc)), 10_000L)
         val runner = AutoPilotRunner(
             targetPackageOverride = "com.autopilot.testhostapp",
-            assetName = "compose-fixture.json"
+            assetName = asset
         )
         val results = runner.run()
-
         results.forEach { r ->
             val status = when { r.skipped -> "SKIP"; r.passed -> "PASS"; else -> "FAIL" }
-            android.util.Log.i(
-                "AutoPilotRunner",
-                "[$status] ${r.id ?: "?"}: ${r.message.ifEmpty { "ok" }}"
-            )
+            android.util.Log.i("AutoPilotRunner",
+                "[$status] ${r.id ?: "?"}: ${r.message.ifEmpty { "ok" }}")
         }
         val failures = results.filter { !it.skipped && !it.passed }
         assertTrue(
-            "Compose fixture failed steps:\n${failures.joinToString("\n") { "  ${it.id ?: "?"}: ${it.message}" }}",
+            "$asset failed steps:\n${failures.joinToString("\n") { "  ${it.id ?: "?"}: ${it.message}" }}",
             failures.isEmpty()
         )
+    }
+
+    @Test
+    fun composeFindAfterTypePlan() {
+        runPlanAndAssert("compose-fixture.json", "fixtureFieldA")
+    }
+
+    @Test
+    fun composeScrollFindPlan() {
+        runPlanAndAssert("compose-scroll-fixture.json", "scrollFieldA")
+    }
+
+    @Test
+    fun composeChurnFindPlan() {
+        runPlanAndAssert("compose-churn-fixture.json", "churnFieldA")
+    }
+
+    @Test
+    fun composeWrapperFindPlan() {
+        runPlanAndAssert("compose-wrapper-fixture.json", "wrapperFieldA")
     }
 }

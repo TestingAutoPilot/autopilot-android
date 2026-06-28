@@ -2,6 +2,7 @@ package com.autopilot.testhostapp
 
 import android.os.SystemClock
 import android.view.KeyEvent
+import android.view.accessibility.AccessibilityNodeInfo
 import androidx.test.platform.app.InstrumentationRegistry
 import androidx.test.uiautomator.*
 import com.google.gson.Gson
@@ -187,7 +188,82 @@ class AutoPilotRunner(
             // Legacy fixture-oriented fallback (TestHostApp ScrollView paths).
             scrollIntoView(sel)
         }
-        return resolveElement(sel)
+        val finalObj = resolveElement(sel)
+        if (!finalObj.exists()) dumpFindFailure(sel)
+        return finalObj
+    }
+
+    // Captures exactly what the runner's UiAutomation sees at the instant of a
+    // failed find — the decisive diagnostic for the find-after-type gap (the
+    // external `uiautomator dump` view may differ from what the in-run query sees
+    // per-query, e.g. cache/recompose state). Logged under AutoPilotRunner with a
+    // FIND-FAIL-DUMP marker so CI logs / logcat can be grepped. (DOPE-free.)
+    private fun dumpFindFailure(sel: SelectorJson) {
+        try {
+            val id = sel.identifier ?: sel.within?.identifier
+            val log = StringBuilder()
+            log.append("FIND-FAIL-DUMP id=$id sel=$sel\n")
+            if (id != null) {
+                // What each query method sees for THIS id, right now.
+                val legacyDesc = device.findObject(UiSelector().description(id)).exists()
+                val o2Desc = device.findObject(By.desc(id))
+                val o2Res = device.findObject(By.res(id))
+                log.append("  legacy UiObject.description exists=$legacyDesc\n")
+                log.append("  UiObject2 By.desc=${o2Desc?.let { "FOUND class=${it.className} bounds=${it.visibleBounds}" } ?: "null"}\n")
+                log.append("  UiObject2 By.res =${o2Res?.let { "FOUND class=${it.className} bounds=${it.visibleBounds}" } ?: "null"}\n")
+            }
+            // Inventory of what IS in the tree the runner sees.
+            val descs = device.findObjects(By.desc(Pattern.compile(".+")))
+                .mapNotNull { try { it.contentDescription } catch (_: Throwable) { null } }
+            log.append("  content-descs visible to runner (${descs.size}): ${descs.joinToString(", ")}\n")
+            val edits = device.findObjects(By.clazz("android.widget.EditText"))
+            log.append("  EditTexts visible to runner (${edits.size}): " +
+                edits.joinToString(", ") { "[${it.visibleBounds}] text='${it.text ?: ""}'" } + "\n")
+            log.append("  scrollables present=${device.findObjects(By.scrollable(true)).isNotEmpty()}\n")
+            // Full hierarchy dump (what the runner's UiAutomation snapshot contains).
+            try {
+                val f = java.io.File(
+                    instrumentation.targetContext.externalCacheDir
+                        ?: instrumentation.targetContext.cacheDir,
+                    "find-fail-${id ?: "x"}-${SystemClock.uptimeMillis()}.xml"
+                )
+                device.dumpWindowHierarchy(f)
+                log.append("  full hierarchy → ${f.absolutePath}\n")
+            } catch (e: Throwable) {
+                log.append("  hierarchy dump failed: ${e.javaClass.simpleName}: ${e.message}\n")
+            }
+            android.util.Log.w("AutoPilotRunner", log.toString())
+        } catch (e: Throwable) {
+            android.util.Log.w("AutoPilotRunner", "FIND-FAIL-DUMP errored: ${e.message}")
+        }
+    }
+
+    // Wait until the desc-matched node's bounds stop moving (two consecutive equal
+    // reads) before acting on it. Real-ScopeDOPE finding (dope-list d200): after a
+    // DOPE row is added the list animates the add-row DOWNWARD; addDistField was
+    // matched at y=1313, then 1425, then 1633 over ~17s. A handle captured at one
+    // position goes stale as the row slides, so focus-tap lands on empty space and
+    // setText on the stale node throws UiObjectNotFoundException. Settling the
+    // layout first makes the find→act sequence atomic w.r.t. the animation.
+    // Returns the settled bounds, or null if the node never appears.
+    private fun waitForStableBounds(id: String, timeoutMs: Long = 4000L): android.graphics.Rect? {
+        var last: android.graphics.Rect? = null
+        var stableSince = 0L
+        val deadline = SystemClock.uptimeMillis() + timeoutMs
+        while (SystemClock.uptimeMillis() < deadline) {
+            val now = try { device.findObject(By.desc(id))?.visibleBounds } catch (_: Throwable) { null }
+            if (now == null) { last = null; stableSince = 0L; Thread.sleep(80); continue }
+            if (now == last) {
+                // Bounds held across reads — require a short hold so a momentary
+                // pause mid-animation isn't mistaken for "settled".
+                if (stableSince == 0L) stableSince = SystemClock.uptimeMillis()
+                if (SystemClock.uptimeMillis() - stableSince >= 250L) return now
+            } else {
+                last = now; stableSince = 0L
+            }
+            Thread.sleep(80)
+        }
+        return last
     }
 
     // Gate the scroll/swipe recovery: it helps ONLY when there is a scrollable
@@ -213,49 +289,128 @@ class AutoPilotRunner(
     //  2. Otherwise fall back to BOUNDS-BASED swipes on the content area —
     //     swipe up to reveal content below, then down, re-checking for the target
     //     by content-desc between swipes. This needs no scrollable handle.
+    // Scroll a (Compose LazyColumn or any) scrollable into the target by performing
+    // the ACTION_SCROLL_FORWARD/BACKWARD accessibility action DIRECTLY on the
+    // scrollable node — NOT a synthetic touch gesture. This is the gesture-free
+    // primitive that works on CI's AOSP x86 image, where gestures both fail to move
+    // the list and corrupt the a11y tree (see scrollIntoViewCompose for the full
+    // finding). Returns true once By.desc(id) is present, false if exhausted.
+    private fun scrollByAccessibilityAction(id: String, maxSteps: Int = 14): Boolean {
+        // Find the scrollable node in the active window that actually exposes a
+        // forward/backward scroll action.
+        fun scrollableNode(): AccessibilityNodeInfo? {
+            val root = try { instrumentation.uiAutomation.rootInActiveWindow } catch (_: Throwable) { null }
+                ?: return null
+            val stack = ArrayDeque<AccessibilityNodeInfo>()
+            stack.addLast(root)
+            var best: AccessibilityNodeInfo? = null
+            while (stack.isNotEmpty()) {
+                val n = stack.removeLast()
+                try {
+                    if (n.isScrollable && n.actionList.any {
+                            it.id == AccessibilityNodeInfo.ACTION_SCROLL_FORWARD ||
+                            it.id == AccessibilityNodeInfo.ACTION_SCROLL_BACKWARD
+                        }) {
+                        // Prefer the largest scrollable (the list, not a tiny inner one).
+                        if (best == null) best = n
+                    }
+                } catch (_: Throwable) {}
+                for (i in 0 until n.childCount) (try { n.getChild(i) } catch (_: Throwable) { null })?.let { stack.addLast(it) }
+            }
+            return best
+        }
+
+        fun act(action: Int): Boolean {
+            val node = scrollableNode() ?: return false
+            return try { node.performAction(action) } catch (_: Throwable) { false }
+        }
+
+        if (device.hasObject(By.desc(id))) return true
+        // Scroll forward (down) until the target appears or the action stops moving.
+        var steps = 0
+        while (steps < maxSteps) {
+            if (!act(AccessibilityNodeInfo.ACTION_SCROLL_FORWARD)) break
+            device.waitForIdle(400)
+            Thread.sleep(120)
+            if (device.hasObject(By.desc(id))) return true
+            steps++
+        }
+        // Not found going down → rewind to the top and try again (the target may
+        // have been above the start position).
+        steps = 0
+        while (steps < maxSteps) {
+            if (!act(AccessibilityNodeInfo.ACTION_SCROLL_BACKWARD)) break
+            device.waitForIdle(400)
+            Thread.sleep(120)
+            if (device.hasObject(By.desc(id))) return true
+            steps++
+        }
+        return device.hasObject(By.desc(id))
+    }
+
     private fun scrollIntoViewCompose(sel: SelectorJson) {
         val id = sel.identifier ?: sel.within?.identifier ?: return
         try {
+            // The IME can squeeze a Compose list into the top fraction, so a deep
+            // (virtualized → not-yet-composed) item can't be scrolled to. Dismiss the
+            // keyboard first, then drive the scroll.
+            //
+            // CRITICAL (real-ScopeDOPE finding): each UiObject2.scroll() blocks on an
+            // a11y event; running it 15+15× per not-found target — especially when the
+            // target is genuinely ABSENT (e.g. a wrong id, or a control not on this
+            // screen) — hammers UiAutomation until it dies (DeadObjectException →
+            // Process crashed). So: STOP THE MOMENT A SCROLL MAKES NO PROGRESS
+            // (scroll() returns whether it moved), and cap hard.
+            //
+            // Drop the keyboard first so the list reclaims its full height before
+            // scrolling — otherwise the IME squeezes the scroll viewport so small
+            // that scroll() reports no-movement immediately and we bail before
+            // reaching a deep item. Use closeIme() (context-aware): on the host app
+            // it ESCs (safe on classic Views, reliably hides the keyboard); on an
+            // external app it does the dialog-safe IMM-hide only. forceDismissIme()
+            // is then a cheap no-op if the IME is already down.
+            closeIme()
+            forceDismissIme()
+            device.waitForIdle(800)
+            if (device.hasObject(By.desc(id))) return
+
+            // PRIMARY (the only thing that works on CI's AOSP x86 image):
+            // dispatch the real ACTION_SCROLL_FORWARD/BACKWARD accessibility action
+            // DIRECTLY on the scrollable node — gesture-free.
+            //
+            // CRITICAL finding, reproduced on CI's exact image (system-images;
+            // android-30;default;x86_64) on an x86 host: UiScrollable.scrollIntoView
+            // and UiObject2.scroll/device.swipe all perform a SYNTHETIC TOUCH GESTURE
+            // ("Scrolling backward ... in 55 steps" in logcat), NOT the accessibility
+            // action — despite the misleading older comment here. On the AOSP image
+            // that gesture (a) does NOT move the Compose LazyColumn (its bounds never
+            // change in the dump) AND (b) CORRUPTS the accessibility tree: after a
+            // single synthetic swipe, `uiautomator dump` returns empty until the
+            // activity restarts, so every later find fails ("scrollFieldLow not
+            // found"). The LazyColumn DOES expose ACTION_SCROLL_FORWARD; performing
+            // that action on the node moves the list without a gesture and without
+            // breaking the tree. (google_apis images tolerate the gesture, which is
+            // why this only ever failed on CI's default/AOSP image.)
+            if (scrollByAccessibilityAction(id)) return
+
+            // FALLBACK (local/interactive where gestures DO work): bounded
+            // UiObject2.scroll, stop on no-movement, cap hard — no thrash crash.
             val container = device.findObjects(By.scrollable(true))
                 .maxByOrNull { it.visibleBounds.width() * it.visibleBounds.height() }
-            if (container != null) {
-                container.setGestureMargin(container.visibleBounds.height() / 8)
-                repeat(8) {
+                ?: return
+            container.setGestureMargin(container.visibleBounds.height() / 8)
+            for (dir in listOf(Direction.DOWN, Direction.UP)) {
+                var n = 0
+                while (n < 8) {
                     if (device.hasObject(By.desc(id))) return
-                    container.scroll(Direction.DOWN, 0.6f); Thread.sleep(120)
-                }
-                repeat(8) {
-                    if (device.hasObject(By.desc(id))) return
-                    container.scroll(Direction.UP, 0.6f); Thread.sleep(120)
+                    val moved = try { container.scroll(dir, 0.8f) } catch (_: Throwable) { return }
+                    Thread.sleep(120)
+                    if (!moved) break
+                    n++
                 }
                 if (device.hasObject(By.desc(id))) return
             }
-            // Bounds-based fallback (Compose scroll with no scrollable handle).
-            swipeScanForDesc(id)
-        } catch (_: Exception) {}
-    }
-
-    // Reveal an off-screen content-desc target by swiping the content area itself
-    // (no scrollable handle needed). Swipes within the middle band of the screen
-    // — above any keyboard, below the toolbar — re-checking after each. Up-swipes
-    // (reveal-below) first since growing lists push the add-row downward, then
-    // down-swipes. Returns as soon as the target appears.
-    private fun swipeScanForDesc(id: String) {
-        val w = device.displayWidth
-        val h = device.displayHeight
-        val x = w / 2
-        val top = (h * 0.30).toInt()      // below the app bar
-        val bottom = (h * 0.62).toInt()   // above where the IME would sit
-        repeat(8) {
-            if (device.hasObject(By.desc(id))) return
-            device.swipe(x, bottom, x, top, 24)   // content moves up → reveal below
-            Thread.sleep(150)
-        }
-        repeat(8) {
-            if (device.hasObject(By.desc(id))) return
-            device.swipe(x, top, x, bottom, 24)   // content moves down → reveal above
-            Thread.sleep(150)
-        }
+        } catch (_: Throwable) {}
     }
 
     private fun resolveElement(sel: SelectorJson): UiObject {
@@ -307,6 +462,31 @@ class AutoPilotRunner(
                 else -> {}
             }
         } catch (_: Exception) {}
+
+        // The target may live in a NESTED scrollable (e.g. scroll-end is inside the
+        // inner R.id.scrollView, instance(1), NOT the outer page ScrollView). Scrolling
+        // only instance(0) never reveals it. Drive EVERY scrollable container via the
+        // accessibility-based UiScrollable (ACTION_SCROLL_* — works headless, where
+        // synthetic gestures do not) until the target is on screen.
+        if (sel.identifier != null && !device.hasObject(By.desc(sel.identifier))) {
+            val target = UiSelector().description(sel.identifier)
+            // Try by the inner scrollable's own content-description first, then by
+            // scrollable index, so we scroll the container that actually holds it.
+            val candidates = listOf(
+                UiScrollable(UiSelector().description("scrollView")),
+                UiScrollable(UiSelector().scrollable(true).instance(1)),
+                UiScrollable(UiSelector().scrollable(true).instance(0)),
+                UiScrollable(UiSelector().scrollable(true))
+            )
+            for (sc in candidates) {
+                if (device.hasObject(By.desc(sel.identifier))) break
+                try {
+                    sc.setMaxSearchSwipes(20)
+                    if (sc.exists()) sc.scrollIntoView(target)
+                    device.waitForIdle(300)
+                } catch (_: Throwable) {}
+            }
+        }
 
         // If still not found (e.g. disabled view that UiScrollable skips), brute-force swipe
         // outside the nested scrollView bounds so the outer ScrollView receives the gesture.
@@ -409,14 +589,25 @@ class AutoPilotRunner(
         } catch (_: Exception) { "" }
     }
 
-    // Find the EditText (UiObject2) whose visible bounds are contained within the
-    // desc-matched node's bounds — the Compose input that visually belongs to the
-    // tagged wrapper even though it is not its UiAutomator child. Null if none.
+    // Find the EditText (UiObject2) that belongs to the desc-matched node — the
+    // Compose input that visually lives within the tagged wrapper even though it is
+    // not its UiAutomator child. Uses largest-INTERSECTION, not strict containment:
+    // when a field is scrolled to the viewport edge (e.g. a below-the-fold field
+    // brought into view on a short screen) either rect can be partially clipped, so
+    // strict `contains` returns null and the value reads '' (the CI-only
+    // compose-scroll-fixture failure). Pick the EditText with the most overlap with
+    // the desc bounds; require a non-trivial overlap so an unrelated field elsewhere
+    // is never matched.
     private fun editTextWithinBounds(descNode: UiObject): UiObject2? {
         return try {
             val outer = descNode.visibleBounds
             device.findObjects(By.clazz("android.widget.EditText"))
-                .firstOrNull { outer.contains(it.visibleBounds) }
+                .mapNotNull { et ->
+                    val r = android.graphics.Rect(et.visibleBounds)
+                    if (r.intersect(outer)) Pair(et, r.width().toLong() * r.height()) else null
+                }
+                .maxByOrNull { it.second }
+                ?.first
         } catch (_: Exception) { null }
     }
 
@@ -492,20 +683,24 @@ class AutoPilotRunner(
             }
             sel.identifier != null -> {
                 if (present) {
-                    // If not immediately visible, try scrolling it into view.
-                    // For scroll-end specifically, also scroll the inner scrollView to bottom
-                    // so the view is physically visible before UiAutomator queries the tree.
+                    // If not immediately visible, scroll it into view. Use the
+                    // accessibility-driven UiScrollable path (ACTION_SCROLL_* — works
+                    // headless, where synthetic gestures may not). For host-app views
+                    // in a deeply-nested / pathologically-short ScrollView (the
+                    // fixture's inner scrollView is only ~90px tall, so gesture swipes
+                    // barely move), ALSO drive the View's own programmatic scroll
+                    // (fullScroll) — verified to reach scroll-end on CI. Keep BOTH:
+                    // the programmatic scroll handles the short nested ScrollView, the
+                    // UiScrollable path handles everything else incl. Compose.
                     if (!device.hasObject(By.desc(sel.identifier))) {
-                        if (sel.identifier == "scroll-end") {
-                            // Programmatically scroll inner ScrollView to bottom on the main thread —
-                            // guaranteed to make scroll-end physically visible regardless of a11y tree state.
+                        if (drivingHostApp && MainActivity.instance != null) {
                             instrumentation.runOnMainSync {
-                                MainActivity.instance?.scrollInnerScrollViewToEnd()
+                                MainActivity.instance?.scrollViewToDescendant(sel.identifier!!)
                             }
-                            Thread.sleep(300)
-                        } else {
-                            scrollIntoView(sel)
+                            device.waitForIdle(400)
                         }
+                        if (!device.hasObject(By.desc(sel.identifier))) scrollIntoView(sel)
+                        if (!device.hasObject(By.desc(sel.identifier))) scrollIntoViewCompose(sel)
                     }
                     val ok = device.wait(Until.hasObject(By.desc(sel.identifier)), timeout)
                     StepResult(id, passed = ok, skipped = false,
@@ -531,9 +726,33 @@ class AutoPilotRunner(
     private fun doClick(step: Step): StepResult {
         val id = step.id ?: "?"
         val sel = step.target ?: return StepResult(id, passed = false, skipped = false, message = "no target")
-        findElement(sel).click()
-        Thread.sleep(300)
-        return StepResult(id, passed = true, skipped = false)
+        // find→settle→click as a UNIT, retried on a stale handle: an animating target
+        // (e.g. the DOPE add-row sliding as rows are inserted) can move between the
+        // settle and the click() — especially under heavy host load — making the
+        // handle stale (UiObjectNotFoundException). Re-find and retry rather than fail.
+        var lastErr: String? = null
+        repeat(3) {
+            try {
+                var el = findElement(sel)
+                if (!el.exists()) {
+                    lastErr = "click target '${sel.identifier ?: sel.role}' not found"
+                    return@repeat
+                }
+                sel.identifier?.let { id2 ->
+                    waitForStableBounds(id2)
+                    val fresh = resolveElement(sel)
+                    if (fresh.exists()) el = fresh
+                }
+                el.click()
+                Thread.sleep(300)
+                return StepResult(id, passed = true, skipped = false)
+            } catch (e: Throwable) {
+                lastErr = "${e.javaClass.simpleName}: ${e.message}"
+                device.waitForIdle(800)
+                Thread.sleep(200)
+            }
+        }
+        return StepResult(id, passed = false, skipped = false, message = lastErr ?: "click failed")
     }
 
     private fun doPress(step: Step): StepResult {
@@ -633,7 +852,10 @@ class AutoPilotRunner(
         // settle so the popup is present before the following menu-item press. The
         // 300ms fixed sleep raced the popup on a loaded emulator; waitForIdle plus a
         // larger settle makes the rightClick→press-item handoff reliable.
-        findElement(sel).longClick()
+        val el = findElement(sel)
+        if (!el.exists()) return StepResult(id, passed = false, skipped = false,
+            message = "rightClick target '${sel.identifier ?: sel.role}' not found")
+        el.longClick()
         device.waitForIdle(1500)
         Thread.sleep(400)
         return StepResult(id, passed = true, skipped = false)
@@ -646,19 +868,55 @@ class AutoPilotRunner(
         val sel = step.target ?: return StepResult(id, passed = false, skipped = false, message = "no target")
         val text = step.args?.text ?: return StepResult(id, passed = false, skipped = false, message = "no text arg")
         val clear = step.args.clear ?: false
-        val matched = findElement(sel)
-        // Compose: the desc node is a wrapper; tapping its center moves platform
-        // focus to the real (separate) EditText. Drive input against whatever is
-        // then focused. For a classic-View EditText the matched node IS the field,
-        // so this still works (it is its own focused node).
-        val field = focusEditableField(matched)
-        if (clear) { field?.setText("") ?: matched.setText("") ; Thread.sleep(50) }
         val finalText = text.replace("\\n", "\n")
-        instrumentation.sendStringSync(finalText)
-        Thread.sleep(400)
-        closeIme()
-        device.waitForIdle(2000)  // let the Compose recompose settle before the next lookup
-        return StepResult(id, passed = true, skipped = false)
+
+        // The find→settle→focus→type sequence is retried as a UNIT. Real-ScopeDOPE
+        // finding (dope-list d200): after a DOPE row is added the add-row animates
+        // DOWNWARD, so a handle captured for addDistField goes stale mid-type and
+        // setText throws UiObjectNotFoundException. waitForStableBounds settles it
+        // first, but under heavy host CPU load (e.g. a parallel build) the animation
+        // can outlast the settle window — so if an op still throws on a stale node,
+        // re-find from scratch and try again rather than failing the step. 3 attempts.
+        var lastErr: String? = null
+        repeat(3) { attempt ->
+            try {
+                var matched = findElement(sel)
+                // Fail loudly if the target was never found — do NOT fall through to
+                // focusEditableField, which would type into whatever field holds focus
+                // (the CI scroll-fixture bug: a below-fold field was not composed, the
+                // find failed, yet text was typed into the focused top field and the
+                // step falsely "passed").
+                if (!matched.exists()) {
+                    lastErr = "type target '${sel.identifier ?: sel.role}' not found"
+                    return@repeat
+                }
+                // Wait for the node to stop moving, then re-resolve a FRESH handle at
+                // its final position before focusing/typing.
+                sel.identifier?.let { id2 ->
+                    waitForStableBounds(id2)
+                    val fresh = resolveElement(sel)
+                    if (fresh.exists()) matched = fresh
+                }
+                // Compose: the desc node is a wrapper; tapping its center moves
+                // platform focus to the real (separate) EditText. For a classic-View
+                // EditText the matched node IS the field (its own focused node).
+                val field = focusEditableField(matched)
+                if (clear) { field?.setText("") ?: matched.setText("") ; Thread.sleep(50) }
+                instrumentation.sendStringSync(finalText)
+                Thread.sleep(400)
+                closeIme()
+                device.waitForIdle(2000)  // let the Compose recompose settle
+                return StepResult(id, passed = true, skipped = false)
+            } catch (e: Throwable) {
+                // Stale handle (node moved/recomposed between find and act). Re-find
+                // and retry; settle a moment so the next find lands on a stable tree.
+                lastErr = "${e.javaClass.simpleName}: ${e.message}"
+                device.waitForIdle(800)
+                Thread.sleep(200)
+            }
+        }
+        return StepResult(id, passed = false, skipped = false,
+            message = lastErr ?: "type failed")
     }
 
     // ── setValue ─────────────────────────────────────────────────────────────
@@ -668,6 +926,9 @@ class AutoPilotRunner(
         val sel = step.target ?: return StepResult(id, passed = false, skipped = false, message = "no target")
         val text = step.args?.text ?: return StepResult(id, passed = false, skipped = false, message = "no text arg")
         val matched = findElement(sel)
+        // Same not-found guard as doType: don't fall through to the focused field.
+        if (!matched.exists()) return StepResult(id, passed = false, skipped = false,
+            message = "setValue target '${sel.identifier ?: sel.role}' not found")
         val field = focusEditableField(matched)
         field?.setText("") ?: matched.setText("")
         Thread.sleep(50)
@@ -713,8 +974,51 @@ class AutoPilotRunner(
     // forceDismissIme(), invoked only on the rare not-found recovery path.
     private fun closeIme() {
         try {
-            device.executeShellCommand("input keyevent 111")  // ESCAPE
-            Thread.sleep(200)
+            // CRITICAL (real-ScopeDOPE finding): KEYCODE_ESCAPE after a type was
+            // DISMISSING THE COMPOSE AlertDialog on the EXTERNAL app — Compose
+            // dialogs treat ESC as dismiss, so typing into caliberField closed the
+            // whole Add-Custom-Ammo form and every later field was "not found".
+            // BUT the bundled host app (TestHostApp, classic Views — no Compose
+            // dialog to dismiss) RELIES on ESC to drop the keyboard; without it the
+            // keyboard stays up and every later find thrashes recovery. So:
+            //   - host app  → ESC (safe + reliably drops the keyboard for the
+            //     classic-View TestHostApp). BUT the bundled Compose fixtures
+            //     (ComposeFixtureActivity) are ALSO drivingHostApp and a Compose
+            //     OutlinedTextField does NOT drop its IME on ESC (verified: ESC
+            //     leaves mInputShown=true on the scroll fixture). A keyboard left up
+            //     squeezes the LazyColumn so the deep field can't be reached
+            //     (compose-scroll-fixture: scrollFieldLow below the fold). So if ESC
+            //     leaves the IME up, drop it with a guarded Back — safe because the
+            //     IME consumes the first Back while shown (the fixture is not a
+            //     Back-dismissable dialog, and even a dialog would stay open).
+            if (drivingHostApp) {
+                device.executeShellCommand("input keyevent 111")  // ESCAPE — safe on classic Views
+                Thread.sleep(150)
+                if (isImeShown()) { device.pressBack(); Thread.sleep(200) }
+                return
+            }
+            //   - external → a window-token IMM-hide can NEVER work (targetContext is
+            //     the TEST app's context, not the app-under-test's Activity — no
+            //     window token), so for an external app it is a guaranteed no-op and
+            //     the keyboard stays up for the WHOLE run. That left the DOPE add-row
+            //     keyboard up: as rows were added the add-row was pushed down and its
+            //     leftmost field (addDistField) sat at/under the keyboard edge, so a
+            //     per-field find thrashed the scroll and the field went stale mid-type
+            //     (d200 UiObjectNotFoundException on real ScopeDOPE).
+            //
+            //   So drop the IME out-of-process with a Back press — but ONLY while the
+            //   IME is actually shown. EMPIRICALLY VERIFIED on real ScopeDOPE: when
+            //   mInputShown=true, Android routes the first Back to the IME window to
+            //   hide itself; the app (even a Compose AlertDialog like Add-Custom-Ammo)
+            //   never sees it, so the dialog STAYS OPEN and the keyboard drops. The
+            //   old "Back always closes the dialog" assumption only held when Back was
+            //   pressed with the IME already DOWN — gating on mInputShown makes it
+            //   dialog-safe. If the IME is not shown, do nothing (a stray Back would
+            //   navigate/close the dialog).
+            if (isImeShown()) {
+                device.pressBack()
+                Thread.sleep(200)
+            }
         } catch (_: Exception) {}
     }
 
@@ -734,23 +1038,38 @@ class AutoPilotRunner(
     private fun forceDismissIme() {
         try {
             if (!isImeShown()) return
-            device.executeShellCommand("input keyevent 111")  // ESCAPE — no back nav
-            Thread.sleep(150)
-            if (!isImeShown()) return
-            // InputMethodManager.hideSoftInputFromWindow on the focused view's
-            // window token — hides the IME without any back event.
-            instrumentation.runOnMainSync {
-                try {
-                    val imm = instrumentation.targetContext
-                        .getSystemService(android.content.Context.INPUT_METHOD_SERVICE)
-                        as? android.view.inputmethod.InputMethodManager
-                    val token = instrumentation.targetContext
-                        .let { (it as? android.app.Activity)?.currentFocus?.windowToken }
-                    if (token != null) imm?.hideSoftInputFromWindow(token, 0)
-                } catch (_: Exception) {}
+            // NOTE: do NOT send KEYCODE_ESCAPE here — Compose AlertDialogs treat ESC
+            // as DISMISS, so it closes the dialog (the real-ScopeDOPE bug: the assert
+            // on ammoSaveButton entered recovery, ESCAPE fired, the Add-Custom-Ammo
+            // dialog closed, every later field/button became "not found").
+            //
+            // On the host app: IMM-hide via the real Activity window token works.
+            if (drivingHostApp) {
+                instrumentation.runOnMainSync {
+                    try {
+                        val imm = instrumentation.targetContext
+                            .getSystemService(android.content.Context.INPUT_METHOD_SERVICE)
+                            as? android.view.inputmethod.InputMethodManager
+                        val token = (instrumentation.targetContext as? android.app.Activity)
+                            ?.currentFocus?.windowToken
+                        if (token != null) imm?.hideSoftInputFromWindow(token, 0)
+                    } catch (_: Exception) {}
+                }
+                Thread.sleep(150)
+                return
             }
-            Thread.sleep(150)
-            // Whatever the IME state now, do NOT pressBack. Proceed.
+            // EXTERNAL app: the IMM-hide can't work (targetContext is the TEST app's
+            // context, not the app-under-test's Activity → no window token). Drop the
+            // keyboard with a Back press, which is SAFE here because we only do it
+            // while the IME is shown (checked above): Android routes the first Back
+            // to the IME window to hide itself, so a Compose AlertDialog (e.g.
+            // Add-Custom-Ammo) never sees it and stays open. EMPIRICALLY VERIFIED on
+            // real ScopeDOPE: typing into caliberField → mInputShown=true → one Back
+            // → mInputShown=false AND caliberField (the dialog) still present. This
+            // is what makes the keyboard-occluded ammoSaveButton readable, and what
+            // lets the DOPE add-row's leftmost field be reached after rows are added.
+            device.pressBack()
+            Thread.sleep(200)
         } catch (_: Exception) {}
     }
 
@@ -948,8 +1267,28 @@ class AutoPilotRunner(
     }
 
     private fun assertEnabled(id: String, sel: SelectorJson, op: String, expected: String): StepResult {
-        val element = findElement(sel)
-        return compare(id, resolveEnabled(sel, element).toString(), op, expected)
+        // Poll up to 5s for the enabled state to satisfy the condition (mirrors
+        // assertValue). Real-ScopeDOPE finding (dope-addrow/dope-numeric-input
+        // assert-add-enabled-valid, actual='false'): after typing a comma decimal
+        // ("1,5") the field value normalizes to 1.5 and the Add button's derived
+        // enabled state flips true — but on a single read right after the type
+        // (especially under host CPU load) the recompose that re-enables the button
+        // has not landed yet, so it reads stale 'false'. A one-shot read raced it;
+        // polling lets the derived state settle, exactly as the value asserts do.
+        val deadline = SystemClock.uptimeMillis() + 5000L
+        var actual = resolveEnabled(sel, findElement(sel)).toString()
+        while (SystemClock.uptimeMillis() < deadline) {
+            val satisfies = when (op) {
+                "equals"    -> actual == expected
+                "notEquals" -> actual != expected
+                else        -> true
+            }
+            if (satisfies) break
+            Thread.sleep(100)
+            device.waitForIdle(300)
+            actual = resolveEnabled(sel, findElement(sel)).toString()
+        }
+        return compare(id, actual, op, expected)
     }
 
     // Determine whether a control is "enabled", correctly handling Jetpack Compose.
