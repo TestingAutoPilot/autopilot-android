@@ -250,6 +250,16 @@ class AutoPilotRunner(
         forceDismissIme()
         obj = resolveElement(sel)
         if (obj.exists()) return obj
+        // Fail-fast guard: if the app under test is not the foreground app, the
+        // element cannot be here no matter how much we scroll — scrolling the
+        // launcher/overlay just burns MINUTES of retry loops (observed on a real
+        // Samsung with a Messenger chat-head overlay stealing focus). Try to
+        // re-front the app ONCE (cheap); if it still isn't foreground, skip the
+        // expensive scroll cascade and fall through to a fast, legible failure.
+        ensureTargetForeground()
+        if (device.currentPackageName != targetPackage) {
+            return resolveElement(sel).also { if (!it.exists()) dumpFindFailure(sel) }
+        }
         //  - bring an off-viewport target back. Only scroll/swipe when it can
         //    actually help (a scrollable container exists, or the node is off the
         //    viewport) — never thrash a fixed, non-scrollable dialog.

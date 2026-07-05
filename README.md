@@ -126,6 +126,24 @@ bash scripts/run-on-device.sh --connect 192.168.1.5:39000 \
 Expected result on a real device is the same as the emulator: **75 PASS + 3 SKIP**
 (the 3 visual actions have no pixel access in an instrumented test).
 
+### Device hygiene for real-hardware runs
+
+A physical phone is a busy environment, and anything that draws over other apps
+or grabs focus will disrupt a run. Before running, on the test device:
+
+- **Close overlay apps** that use "draw over other apps" (`SYSTEM_ALERT_WINDOW`) —
+  Facebook Messenger **chat heads** are the classic offender (a floating bubble
+  that steals focus from the app under test). Bubbles, screen recorders, and
+  floating-widget apps do the same. Force-stop them or revoke their display-over
+  permission.
+- Prefer a **clean/dedicated test device** with a stock launcher and few
+  background apps. Heavily-personalized phones (many notifications, OEM edge
+  panels, always-on assistants) are more likely to interfere.
+- The runner defends itself: it re-fronts the app before each step and **fails
+  fast** (instead of scroll-retrying for minutes) when the app under test is not
+  the foreground app — so a focus steal produces a quick, legible failure rather
+  than a hang. But it cannot dismiss an arbitrary third-party overlay for you.
+
 ## Results
 
 The unified 78-step plan achieves **75 PASS + 3 SKIP** on Android. The 3 skipped steps require screen capture APIs not available in instrumented tests.
