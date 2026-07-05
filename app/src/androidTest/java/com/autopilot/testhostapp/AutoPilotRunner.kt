@@ -120,6 +120,45 @@ class AutoPilotRunner(
         device.wait(Until.hasObject(By.pkg(targetPackage).depth(0)), 10_000L)
     }
 
+    /**
+     * Ensure the target app is the foreground app before acting on it. Some
+     * launchers (observed on Motorola's launcher on a real device) reclaim
+     * foreground shortly after the app is launched, so a step that ran a beat
+     * after launch would query the launcher's UI instead of the app and fail.
+     *
+     * No-op when the app is already foreground (the normal case on the emulator
+     * and most devices), so this cannot regress a healthy run — it only re-asserts
+     * foreground when it has actually been lost. Re-issues the launch intent (the
+     * same mechanism `launchTargetApp` uses; also valid for the bundled host app,
+     * whose launch intent resolves to its MainActivity) and waits for the app's
+     * window to come back on top.
+     */
+    private fun ensureTargetForeground() {
+        if (device.currentPackageName == targetPackage) return
+        // A pulled-down notification shade / quick-settings panel is the system UI
+        // package, not a launcher — an app relaunch won't dismiss it. Close it
+        // first. (Real-device swipe gestures can inadvertently pull the shade; the
+        // emulator's gesture zones differ, so this only bites on hardware.)
+        if (device.currentPackageName == "com.android.systemui") {
+            device.pressBack()
+            device.pressHome()
+        }
+        if (device.currentPackageName == targetPackage) return
+        val ctx = instrumentation.context
+        val intent = ctx.packageManager.getLaunchIntentForPackage(targetPackage) ?: return
+        // REORDER_TO_FRONT brings an existing instance forward without recreating
+        // it (so app state / typed text is preserved); NEW_TASK is required from a
+        // non-activity context.
+        intent.addFlags(
+            android.content.Intent.FLAG_ACTIVITY_NEW_TASK or
+            android.content.Intent.FLAG_ACTIVITY_REORDER_TO_FRONT)
+        repeat(3) {
+            if (device.currentPackageName == targetPackage) return
+            ctx.startActivity(intent)
+            device.wait(Until.hasObject(By.pkg(targetPackage).depth(0)), 3_000L)
+        }
+    }
+
     /** Best-effort dismissal of a blocking runtime-permission system dialog.
      * Only acts when the plan opted in (dismissPermissionDialogs). Taps the
      * "while using"/"allow" affordance if a permission-controller dialog is up.
@@ -158,6 +197,11 @@ class AutoPilotRunner(
         // plans that drive a different surface (e.g. the Compose fixture dialog).
         if (drivingHostApp && plan.defaults?.skipInitialScroll != true) scrollToTop()
         return plan.steps.map { step ->
+            // Some launchers reclaim foreground after launch (seen on a real
+            // Motorola device); re-assert the app is on top before acting, so the
+            // step queries the app's UI and not the launcher's. No-op when already
+            // foreground, so healthy runs (emulator, most devices) are unaffected.
+            ensureTargetForeground()
             // A permission dialog can surface on screen entry mid-plan; clear it
             // (opt-in) before the step interacts with the now-covered UI.
             dismissPermissionDialogIfPresent()
@@ -168,10 +212,14 @@ class AutoPilotRunner(
     private fun scrollToTop() {
         closeIme()
         Thread.sleep(300)
-        // Swipe upward 4 times to reach top of the outer ScrollView
+        // Fling the content to the top (finger moves DOWN → content scrolls up).
+        // Start BELOW the top ~40% of the screen: a swipe that begins in the top
+        // edge zone pulls the notification shade / quick-settings on real devices
+        // (seen on real Motorola + Samsung hardware), covering the app. The
+        // emulator has no such gesture zone, so this only bites on hardware.
         repeat(4) {
             val h = device.displayHeight; val w = device.displayWidth
-            device.swipe(w / 2, h / 4, w / 2, h * 3 / 4, 20)
+            device.swipe(w / 2, h / 2, w / 2, h * 9 / 10, 20)
             Thread.sleep(150)
         }
     }
@@ -525,8 +573,10 @@ class AutoPilotRunner(
                 if (resolveElement(sel).exists()) return
             }
             repeat(4) {
-                // Downward swipe in case element is below current position
-                device.swipe(w / 2, h / 3, w / 2, h * 2 / 3, 20)
+                // Downward swipe in case element is below current position. Start at
+                // mid-screen (not h/3): a downward gesture beginning in the top edge
+                // zone pulls the notification shade on real devices, covering the app.
+                device.swipe(w / 2, h / 2, w / 2, h * 9 / 10, 20)
                 Thread.sleep(150)
                 if (resolveElement(sel).exists()) return
             }
